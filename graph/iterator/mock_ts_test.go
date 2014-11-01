@@ -14,18 +14,19 @@
 
 package iterator
 
-// A quickly mocked version of the TripleStore interface, for use in tests.
-// Can better used Mock.Called but will fill in as needed.
+import (
+	"github.com/google/cayley/graph"
+	"github.com/google/cayley/quad"
+)
 
-import "github.com/google/cayley/graph"
-
+// store is a mocked version of the QuadStore interface, for use in tests.
 type store struct {
 	data []string
 	iter graph.Iterator
 }
 
-func (ts *store) ValueOf(s string) graph.Value {
-	for i, v := range ts.data {
+func (qs *store) ValueOf(s string) graph.Value {
+	for i, v := range qs.data {
 		if s == v {
 			return i
 		}
@@ -33,42 +34,42 @@ func (ts *store) ValueOf(s string) graph.Value {
 	return nil
 }
 
-func (ts *store) AddTriple(*graph.Triple) {}
+func (qs *store) ApplyDeltas([]graph.Delta) error { return nil }
 
-func (ts *store) AddTripleSet([]*graph.Triple) {}
+func (qs *store) Quad(graph.Value) quad.Quad { return quad.Quad{} }
 
-func (ts *store) Triple(graph.Value) *graph.Triple { return &graph.Triple{} }
-
-func (ts *store) TripleIterator(d graph.Direction, i graph.Value) graph.Iterator {
-	return ts.iter
+func (qs *store) QuadIterator(d quad.Direction, i graph.Value) graph.Iterator {
+	return qs.iter
 }
 
-func (ts *store) NodesAllIterator() graph.Iterator { return &Null{} }
+func (qs *store) NodesAllIterator() graph.Iterator { return &Null{} }
 
-func (ts *store) TriplesAllIterator() graph.Iterator { return &Null{} }
+func (qs *store) QuadsAllIterator() graph.Iterator { return &Null{} }
 
-func (ts *store) NameOf(v graph.Value) string {
+func (qs *store) NameOf(v graph.Value) string {
 	i := v.(int)
-	if i < 0 || i >= len(ts.data) {
+	if i < 0 || i >= len(qs.data) {
 		return ""
 	}
-	return ts.data[i]
+	return qs.data[i]
 }
 
-func (ts *store) Size() int64 { return 0 }
+func (qs *store) Size() int64 { return 0 }
 
-func (ts *store) DebugPrint() {}
+func (qs *store) Horizon() int64 { return 0 }
 
-func (ts *store) OptimizeIterator(it graph.Iterator) (graph.Iterator, bool) {
+func (qs *store) DebugPrint() {}
+
+func (qs *store) OptimizeIterator(it graph.Iterator) (graph.Iterator, bool) {
 	return &Null{}, false
 }
 
-func (ts *store) FixedIterator() graph.FixedIterator {
-	return NewFixedIteratorWithCompare(BasicEquality)
+func (qs *store) FixedIterator() graph.FixedIterator {
+	return NewFixed(Identity)
 }
 
-func (ts *store) Close() {}
+func (qs *store) Close() {}
 
-func (ts *store) TripleDirection(graph.Value, graph.Direction) graph.Value { return 0 }
+func (qs *store) QuadDirection(graph.Value, quad.Direction) graph.Value { return 0 }
 
-func (ts *store) RemoveTriple(t *graph.Triple) {}
+func (qs *store) RemoveQuad(t quad.Quad) {}

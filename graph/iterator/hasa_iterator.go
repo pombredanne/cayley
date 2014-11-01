@@ -21,47 +21,52 @@ package iterator
 //
 // HasA is weird in that it may return the same value twice if on the Next()
 // path. That's okay -- in reality, it can be viewed as returning the value for
-// a new triple, but to make logic much simpler, here we have the HasA.
+// a new quad, but to make logic much simpler, here we have the HasA.
 //
-// Likewise, it's important to think about Check()ing a HasA. When given a
+// Likewise, it's important to think about Contains()ing a HasA. When given a
 // value to check, it means "Check all predicates that have this value for your
 // direction against the subiterator." This would imply that there's more than
-// one possibility for the same Check()ed value. While we could return the
-// number of options, it's simpler to return one, and then call NextResult()
+// one possibility for the same Contains()ed value. While we could return the
+// number of options, it's simpler to return one, and then call NextPath()
 // enough times to enumerate the options. (In fact, one could argue that the
-// raison d'etre for NextResult() is this iterator).
+// raison d'etre for NextPath() is this iterator).
 //
 // Alternatively, can be seen as the dual of the LinksTo iterator.
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/barakmich/glog"
 
 	"github.com/google/cayley/graph"
+	"github.com/google/cayley/quad"
 )
 
-// A HasA consists of a reference back to the graph.TripleStore that it references,
-// a primary subiterator, a direction in which the triples for that subiterator point,
-// and a temporary holder for the iterator generated on Check().
+// A HasA consists of a reference back to the graph.QuadStore that it references,
+// a primary subiterator, a direction in which the quads for that subiterator point,
+// and a temporary holder for the iterator generated on Contains().
 type HasA struct {
-	Base
-	ts        graph.TripleStore
+	uid       uint64
+	tags      graph.Tagger
+	qs        graph.QuadStore
 	primaryIt graph.Iterator
-	dir       graph.Direction
+	dir       quad.Direction
 	resultIt  graph.Iterator
+	result    graph.Value
+	runstats  graph.IteratorStats
 }
 
-// Construct a new HasA iterator, given the triple subiterator, and the triple
+// Construct a new HasA iterator, given the quad subiterator, and the quad
 // direction for which it stands.
-func NewHasA(ts graph.TripleStore, subIt graph.Iterator, d graph.Direction) *HasA {
-	var hasa HasA
-	BaseInit(&hasa.Base)
-	hasa.ts = ts
-	hasa.primaryIt = subIt
-	hasa.dir = d
-	return &hasa
+func NewHasA(qs graph.QuadStore, subIt graph.Iterator, d quad.Direction) *HasA {
+	return &HasA{
+		uid:       NextUID(),
+		qs:        qs,
+		primaryIt: subIt,
+		dir:       d,
+	}
+}
+
+func (it *HasA) UID() uint64 {
+	return it.uid
 }
 
 // Return our sole subiterator.
@@ -76,17 +81,21 @@ func (it *HasA) Reset() {
 	}
 }
 
+func (it *HasA) Tagger() *graph.Tagger {
+	return &it.tags
+}
+
 func (it *HasA) Clone() graph.Iterator {
-	out := NewHasA(it.ts, it.primaryIt.Clone(), it.dir)
-	out.CopyTagsFrom(it)
+	out := NewHasA(it.qs, it.primaryIt.Clone(), it.dir)
+	out.tags.CopyFrom(it)
 	return out
 }
 
 // Direction accessor.
-func (it *HasA) Direction() graph.Direction { return it.dir }
+func (it *HasA) Direction() quad.Direction { return it.dir }
 
 // Pass the Optimize() call along to the subiterator. If it becomes Null,
-// then the HasA becomes Null (there are no triples that have any directions).
+// then the HasA becomes Null (there are no quads that have any directions).
 func (it *HasA) Optimize() (graph.Iterator, bool) {
 	newPrimary, changed := it.primaryIt.Optimize()
 	if changed {
@@ -100,7 +109,14 @@ func (it *HasA) Optimize() (graph.Iterator, bool) {
 
 // Pass the TagResults down the chain.
 func (it *HasA) TagResults(dst map[string]graph.Value) {
-	it.Base.TagResults(dst)
+	for _, tag := range it.tags.Tags() {
+		dst[tag] = it.Result()
+	}
+
+	for tag, value := range it.tags.Fixed() {
+		dst[tag] = value
+	}
+
 	it.primaryIt.TagResults(dst)
 }
 
@@ -111,45 +127,46 @@ func (it *HasA) ResultTree() *graph.ResultTree {
 	return tree
 }
 
-// Print some information about this iterator.
-func (it *HasA) DebugString(indent int) string {
-	var tags string
-	for _, k := range it.Tags() {
-		tags += fmt.Sprintf("%s;", k)
+func (it *HasA) Describe() graph.Description {
+	primary := it.primaryIt.Describe()
+	return graph.Description{
+		UID:       it.UID(),
+		Type:      it.Type(),
+		Tags:      it.tags.Tags(),
+		Direction: it.dir,
+		Iterator:  &primary,
 	}
-	return fmt.Sprintf("%s(%s %d tags:%s direction:%s\n%s)", strings.Repeat(" ", indent), it.Type(), it.UID(), tags, it.dir, it.primaryIt.DebugString(indent+4))
 }
 
 // Check a value against our internal iterator. In order to do this, we must first open a new
-// iterator of "triples that have `val` in our direction", given to us by the triple store,
-// and then Next() values out of that iterator and Check() them against our subiterator.
-func (it *HasA) Check(val graph.Value) bool {
-	graph.CheckLogIn(it, val)
+// iterator of "quads that have `val` in our direction", given to us by the quad store,
+// and then Next() values out of that iterator and Contains() them against our subiterator.
+func (it *HasA) Contains(val graph.Value) bool {
+	graph.ContainsLogIn(it, val)
+	it.runstats.Contains += 1
 	if glog.V(4) {
-		glog.V(4).Infoln("Id is", it.ts.NameOf(val))
+		glog.V(4).Infoln("Id is", it.qs.NameOf(val))
 	}
 	// TODO(barakmich): Optimize this
 	if it.resultIt != nil {
 		it.resultIt.Close()
 	}
-	it.resultIt = it.ts.TripleIterator(it.dir, val)
-	return graph.CheckLogOut(it, val, it.GetCheckResult())
+	it.resultIt = it.qs.QuadIterator(it.dir, val)
+	return graph.ContainsLogOut(it, val, it.NextContains())
 }
 
-// GetCheckResult() is shared code between Check() and GetNextResult() -- calls next on the
-// result iterator (a triple iterator based on the last checked value) and returns true if
+// NextContains() is shared code between Contains() and GetNextResult() -- calls next on the
+// result iterator (a quad iterator based on the last checked value) and returns true if
 // another match is made.
-func (it *HasA) GetCheckResult() bool {
-	for {
-		linkVal, ok := it.resultIt.Next()
-		if !ok {
-			break
-		}
+func (it *HasA) NextContains() bool {
+	for graph.Next(it.resultIt) {
+		it.runstats.ContainsNext += 1
+		link := it.resultIt.Result()
 		if glog.V(4) {
-			glog.V(4).Infoln("Triple is", it.ts.Triple(linkVal))
+			glog.V(4).Infoln("Quad is", it.qs.Quad(link))
 		}
-		if it.primaryIt.Check(linkVal) {
-			it.Last = it.ts.TripleDirection(linkVal, it.dir)
+		if it.primaryIt.Contains(link) {
+			it.result = it.qs.QuadDirection(link, it.dir)
 			return true
 		}
 	}
@@ -157,57 +174,67 @@ func (it *HasA) GetCheckResult() bool {
 }
 
 // Get the next result that matches this branch.
-func (it *HasA) NextResult() bool {
-	// Order here is important. If the subiterator has a NextResult, then we
+func (it *HasA) NextPath() bool {
+	// Order here is important. If the subiterator has a NextPath, then we
 	// need do nothing -- there is a next result, and we shouldn't move forward.
-	// However, we then need to get the next result from our last Check().
+	// However, we then need to get the next result from our last Contains().
 	//
-	// The upshot is, the end of NextResult() bubbles up from the bottom of the
+	// The upshot is, the end of NextPath() bubbles up from the bottom of the
 	// iterator tree up, and we need to respect that.
-	if it.primaryIt.NextResult() {
+	glog.V(4).Infoln("HASA", it.UID(), "NextPath")
+	if it.primaryIt.NextPath() {
 		return true
 	}
-	return it.GetCheckResult()
+	result := it.NextContains()
+	glog.V(4).Infoln("HASA", it.UID(), "NextPath Returns", result, "")
+	return result
 }
 
-// Get the next result from this iterator. This is simpler than Check. We have a
-// subiterator we can get a value from, and we can take that resultant triple,
+// Next advances the iterator. This is simpler than Contains. We have a
+// subiterator we can get a value from, and we can take that resultant quad,
 // pull our direction out of it, and return that.
-func (it *HasA) Next() (graph.Value, bool) {
+func (it *HasA) Next() bool {
 	graph.NextLogIn(it)
+	it.runstats.Next += 1
 	if it.resultIt != nil {
 		it.resultIt.Close()
 	}
 	it.resultIt = &Null{}
 
-	tID, ok := it.primaryIt.Next()
-	if !ok {
+	if !graph.Next(it.primaryIt) {
 		return graph.NextLogOut(it, 0, false)
 	}
-	name := it.ts.Triple(tID).Get(it.dir)
-	val := it.ts.ValueOf(name)
-	it.Last = val
+	tID := it.primaryIt.Result()
+	val := it.qs.QuadDirection(tID, it.dir)
+	it.result = val
 	return graph.NextLogOut(it, val, true)
+}
+
+func (it *HasA) Result() graph.Value {
+	return it.result
 }
 
 // GetStats() returns the statistics on the HasA iterator. This is curious. Next
 // cost is easy, it's an extra call or so on top of the subiterator Next cost.
-// CheckCost involves going to the graph.TripleStore, iterating out values, and hoping
+// ContainsCost involves going to the graph.QuadStore, iterating out values, and hoping
 // one sticks -- potentially expensive, depending on fanout. Size, however, is
 // potentially smaller. we know at worst it's the size of the subiterator, but
 // if there are many repeated values, it could be much smaller in totality.
 func (it *HasA) Stats() graph.IteratorStats {
 	subitStats := it.primaryIt.Stats()
-	// TODO(barakmich): These should really come from the triplestore itself
+	// TODO(barakmich): These should really come from the quadstore itself
 	// and be optimized.
 	faninFactor := int64(1)
 	fanoutFactor := int64(30)
 	nextConstant := int64(2)
-	tripleConstant := int64(1)
+	quadConstant := int64(1)
 	return graph.IteratorStats{
-		NextCost:  tripleConstant + subitStats.NextCost,
-		CheckCost: (fanoutFactor * nextConstant) * subitStats.CheckCost,
-		Size:      faninFactor * subitStats.Size,
+		NextCost:     quadConstant + subitStats.NextCost,
+		ContainsCost: (fanoutFactor * nextConstant) * subitStats.ContainsCost,
+		Size:         faninFactor * subitStats.Size,
+		Next:         it.runstats.Next,
+		Contains:     it.runstats.Contains,
+		ContainsNext: it.runstats.ContainsNext,
 	}
 }
 
@@ -221,3 +248,7 @@ func (it *HasA) Close() {
 
 // Register this iterator as a HasA.
 func (it *HasA) Type() graph.Type { return graph.HasA }
+
+func (it *HasA) Size() (int64, bool) {
+	return it.Stats().Size, false
+}

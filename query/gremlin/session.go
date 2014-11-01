@@ -21,130 +21,119 @@ import (
 	"time"
 
 	"github.com/robertkrimen/otto"
+	// Provide underscore JS library.
+	_ "github.com/robertkrimen/otto/underscore"
 
 	"github.com/google/cayley/graph"
+	"github.com/google/cayley/query"
 )
 
+var ErrKillTimeout = errors.New("query timed out")
+
 type Session struct {
-	ts                   graph.TripleStore
-	currentChannel       chan interface{}
-	env                  *otto.Otto
-	debug                bool
-	limit                int
-	count                int
-	dataOutput           []interface{}
-	lookingForQueryShape bool
-	queryShape           map[string]interface{}
-	err                  error
-	script               *otto.Script
-	doHalt               bool
-	timeoutSec           time.Duration
-	emptyEnv             *otto.Otto
+	qs graph.QuadStore
+
+	wk      *worker
+	script  *otto.Script
+	persist *otto.Otto
+
+	timeout time.Duration
+	kill    chan struct{}
+
+	debug      bool
+	dataOutput []interface{}
+
+	err error
 }
 
-func NewSession(inputTripleStore graph.TripleStore, timeoutSec int, persist bool) *Session {
-	var g Session
-	g.ts = inputTripleStore
-	g.env = BuildEnviron(&g)
-	g.limit = -1
-	g.count = 0
-	g.lookingForQueryShape = false
+func NewSession(qs graph.QuadStore, timeout time.Duration, persist bool) *Session {
+	g := Session{
+		qs:      qs,
+		wk:      newWorker(qs),
+		timeout: timeout,
+	}
 	if persist {
-		g.emptyEnv = g.env
+		g.persist = g.wk.env
 	}
-	if timeoutSec < 0 {
-		g.timeoutSec = time.Duration(-1)
-	} else {
-		g.timeoutSec = time.Duration(timeoutSec)
-	}
-	g.ClearJson()
 	return &g
 }
 
-type GremlinResult struct {
+type Result struct {
 	metaresult    bool
-	err           string
+	err           error
 	val           *otto.Value
-	actualResults *map[string]graph.Value
+	actualResults map[string]graph.Value
 }
 
 func (s *Session) ToggleDebug() {
 	s.debug = !s.debug
 }
 
-func (s *Session) GetQuery(input string, output_struct chan map[string]interface{}) {
-	defer close(output_struct)
-	s.queryShape = make(map[string]interface{})
-	s.lookingForQueryShape = true
-	s.env.Run(input)
-	output_struct <- s.queryShape
-	s.queryShape = nil
+func (s *Session) GetQuery(input string, out chan map[string]interface{}) {
+	defer close(out)
+	s.wk.shape = make(map[string]interface{})
+	s.wk.env.Run(input)
+	out <- s.wk.shape
+	s.wk.shape = nil
 }
 
-func (s *Session) InputParses(input string) (graph.ParseResult, error) {
-	script, err := s.env.Compile("", input)
+func (s *Session) InputParses(input string) (query.ParseResult, error) {
+	script, err := s.wk.env.Compile("", input)
 	if err != nil {
-		return graph.ParseFail, err
+		return query.ParseFail, err
 	}
 	s.script = script
-	return graph.Parsed, nil
+	return query.Parsed, nil
 }
-
-func (s *Session) SendResult(result *GremlinResult) bool {
-	if s.limit >= 0 && s.limit == s.count {
-		return false
-	}
-	if s.doHalt {
-		return false
-	}
-	if s.currentChannel != nil {
-		s.currentChannel <- result
-		s.count++
-		if s.limit >= 0 && s.limit == s.count {
-			return false
-		} else {
-			return true
-		}
-	}
-	return false
-}
-
-var halt = errors.New("Query Timeout")
 
 func (s *Session) runUnsafe(input interface{}) (otto.Value, error) {
-	s.doHalt = false
+	wk := s.wk
 	defer func() {
-		if caught := recover(); caught != nil {
-			if caught == halt {
-				s.err = halt
+		if r := recover(); r != nil {
+			if r == ErrKillTimeout {
+				s.err = ErrKillTimeout
+				wk.env = s.persist
 				return
 			}
-			panic(caught) // Something else happened, repanic!
+			panic(r)
 		}
 	}()
 
-	s.env.Interrupt = make(chan func(), 1) // The buffer prevents blocking
+	// Use buffered chan to prevent blocking.
+	wk.env.Interrupt = make(chan func(), 1)
+	s.kill = make(chan struct{})
+	wk.kill = s.kill
 
-	if s.timeoutSec != -1 {
+	done := make(chan struct{})
+	defer close(done)
+	if s.timeout >= 0 {
 		go func() {
-			time.Sleep(s.timeoutSec * time.Second) // Stop after two seconds
-			s.doHalt = true
-			if s.env != nil {
-				s.env.Interrupt <- func() {
-					panic(halt)
+			time.Sleep(s.timeout)
+			select {
+			case <-done:
+			default:
+				close(s.kill)
+				wk.Lock()
+				if wk.env != nil {
+					wk.env.Interrupt <- func() {
+						panic(ErrKillTimeout)
+					}
 				}
-				s.env = s.emptyEnv
+				wk.Unlock()
 			}
 		}()
 	}
 
-	return s.env.Run(input) // Here be dragons (risky code)
+	wk.Lock()
+	env := wk.env
+	wk.Unlock()
+	return env.Run(input)
 }
 
-func (s *Session) ExecInput(input string, out chan interface{}, limit int) {
+func (s *Session) ExecInput(input string, out chan interface{}, _ int) {
 	defer close(out)
 	s.err = nil
-	s.currentChannel = out
+	s.wk.results = out
 	var err error
 	var value otto.Value
 	if s.script == nil {
@@ -152,28 +141,23 @@ func (s *Session) ExecInput(input string, out chan interface{}, limit int) {
 	} else {
 		value, err = s.runUnsafe(s.script)
 	}
-	if err != nil {
-		out <- &GremlinResult{metaresult: true,
-			err:           err.Error(),
-			val:           &value,
-			actualResults: nil}
-	} else {
-		out <- &GremlinResult{metaresult: true,
-			err:           "",
-			val:           &value,
-			actualResults: nil}
+	out <- &Result{
+		metaresult: true,
+		err:        err,
+		val:        &value,
 	}
-	s.currentChannel = nil
+	s.wk.results = nil
 	s.script = nil
-	s.env = s.emptyEnv
-	return
+	s.wk.Lock()
+	s.wk.env = s.persist
+	s.wk.Unlock()
 }
 
 func (s *Session) ToText(result interface{}) string {
-	data := result.(*GremlinResult)
+	data := result.(*Result)
 	if data.metaresult {
-		if data.err != "" {
-			return fmt.Sprintln("Error: ", data.err)
+		if data.err != nil {
+			return fmt.Sprintf("Error: %v\n", data.err)
 		}
 		if data.val != nil {
 			s, _ := data.val.Export()
@@ -191,9 +175,9 @@ func (s *Session) ToText(result interface{}) string {
 	out = fmt.Sprintln("****")
 	if data.val == nil {
 		tags := data.actualResults
-		tagKeys := make([]string, len(*tags))
+		tagKeys := make([]string, len(tags))
 		i := 0
-		for k, _ := range *tags {
+		for k := range tags {
 			tagKeys[i] = k
 			i++
 		}
@@ -202,14 +186,22 @@ func (s *Session) ToText(result interface{}) string {
 			if k == "$_" {
 				continue
 			}
-			out += fmt.Sprintf("%s : %s\n", k, s.ts.NameOf((*tags)[k]))
+			out += fmt.Sprintf("%s : %s\n", k, s.qs.NameOf(tags[k]))
 		}
 	} else {
 		if data.val.IsObject() {
 			export, _ := data.val.Export()
-			mapExport := export.(map[string]string)
-			for k, v := range mapExport {
-				out += fmt.Sprintf("%s : %v\n", k, v)
+			switch export := export.(type) {
+			case map[string]string:
+				for k, v := range export {
+					out += fmt.Sprintf("%s : %s\n", k, v)
+				}
+			case map[string]interface{}:
+				for k, v := range export {
+					out += fmt.Sprintf("%s : %v\n", k, v)
+				}
+			default:
+				panic(fmt.Sprintf("unexpected type: %T", export))
 			}
 		} else {
 			strVersion, _ := data.val.ToString()
@@ -220,47 +212,53 @@ func (s *Session) ToText(result interface{}) string {
 }
 
 // Web stuff
-func (ses *Session) BuildJson(result interface{}) {
-	data := result.(*GremlinResult)
+func (s *Session) BuildJSON(result interface{}) {
+	data := result.(*Result)
 	if !data.metaresult {
 		if data.val == nil {
 			obj := make(map[string]string)
 			tags := data.actualResults
-			tagKeys := make([]string, len(*tags))
-			i := 0
-			for k, _ := range *tags {
-				tagKeys[i] = k
-				i++
+			var tagKeys []string
+			for k := range tags {
+				tagKeys = append(tagKeys, k)
 			}
 			sort.Strings(tagKeys)
 			for _, k := range tagKeys {
-				obj[k] = ses.ts.NameOf((*tags)[k])
+				name := s.qs.NameOf(tags[k])
+				if name != "" {
+					obj[k] = name
+				} else {
+					delete(obj, k)
+				}
 			}
-			ses.dataOutput = append(ses.dataOutput, obj)
+			if len(obj) != 0 {
+				s.dataOutput = append(s.dataOutput, obj)
+			}
 		} else {
 			if data.val.IsObject() {
 				export, _ := data.val.Export()
-				ses.dataOutput = append(ses.dataOutput, export)
+				s.dataOutput = append(s.dataOutput, export)
 			} else {
 				strVersion, _ := data.val.ToString()
-				ses.dataOutput = append(ses.dataOutput, strVersion)
+				s.dataOutput = append(s.dataOutput, strVersion)
 			}
 		}
 	}
-
 }
 
-func (ses *Session) GetJson() (interface{}, error) {
-	defer ses.ClearJson()
-	if ses.err != nil {
-		return nil, ses.err
+func (s *Session) GetJSON() ([]interface{}, error) {
+	defer s.ClearJSON()
+	if s.err != nil {
+		return nil, s.err
 	}
-	if ses.doHalt {
-		return nil, halt
+	select {
+	case <-s.kill:
+		return nil, ErrKillTimeout
+	default:
+		return s.dataOutput, nil
 	}
-	return ses.dataOutput, nil
 }
 
-func (ses *Session) ClearJson() {
-	ses.dataOutput = nil
+func (s *Session) ClearJSON() {
+	s.dataOutput = nil
 }

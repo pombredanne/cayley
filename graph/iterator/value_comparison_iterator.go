@@ -17,7 +17,7 @@ package iterator
 // "Value Comparison" is a unary operator -- a filter across the values in the
 // relevant subiterator.
 //
-// This is hugely useful for things like provenance, but value ranges in general
+// This is hugely useful for things like label, but value ranges in general
 // come up from time to time. At *worst* we're as big as our underlying iterator.
 // At best, we're the null iterator.
 //
@@ -27,10 +27,8 @@ package iterator
 // In MQL terms, this is the [{"age>=": 21}] concept.
 
 import (
-	"fmt"
 	"log"
 	"strconv"
-	"strings"
 
 	"github.com/google/cayley/graph"
 )
@@ -38,36 +36,42 @@ import (
 type Operator int
 
 const (
-	kCompareLT Operator = iota
-	kCompareLTE
-	kCompareGT
-	kCompareGTE
+	compareLT Operator = iota
+	compareLTE
+	compareGT
+	compareGTE
 	// Why no Equals? Because that's usually an AndIterator.
 )
 
 type Comparison struct {
-	Base
-	subIt graph.Iterator
-	op    Operator
-	val   interface{}
-	ts    graph.TripleStore
+	uid    uint64
+	tags   graph.Tagger
+	subIt  graph.Iterator
+	op     Operator
+	val    interface{}
+	qs     graph.QuadStore
+	result graph.Value
 }
 
-func NewComparison(sub graph.Iterator, op Operator, val interface{}, ts graph.TripleStore) *Comparison {
-	var vc Comparison
-	BaseInit(&vc.Base)
-	vc.subIt = sub
-	vc.op = op
-	vc.val = val
-	vc.ts = ts
-	return &vc
+func NewComparison(sub graph.Iterator, op Operator, val interface{}, qs graph.QuadStore) *Comparison {
+	return &Comparison{
+		uid:   NextUID(),
+		subIt: sub,
+		op:    op,
+		val:   val,
+		qs:    qs,
+	}
+}
+
+func (it *Comparison) UID() uint64 {
+	return it.uid
 }
 
 // Here's the non-boilerplate part of the ValueComparison iterator. Given a value
 // and our operator, determine whether or not we meet the requirement.
 func (it *Comparison) doComparison(val graph.Value) bool {
 	//TODO(barakmich): Implement string comparison.
-	nodeStr := it.ts.NameOf(val)
+	nodeStr := it.qs.NameOf(val)
 	switch cVal := it.val.(type) {
 	case int:
 		cInt := int64(cVal)
@@ -93,13 +97,13 @@ func (it *Comparison) Close() {
 
 func RunIntOp(a int64, op Operator, b int64) bool {
 	switch op {
-	case kCompareLT:
+	case compareLT:
 		return a < b
-	case kCompareLTE:
+	case compareLTE:
 		return a <= b
-	case kCompareGT:
+	case compareGT:
 		return a > b
-	case kCompareGTE:
+	case compareGTE:
 		return a >= b
 	default:
 		log.Fatal("Unknown operator type")
@@ -111,64 +115,86 @@ func (it *Comparison) Reset() {
 	it.subIt.Reset()
 }
 
+func (it *Comparison) Tagger() *graph.Tagger {
+	return &it.tags
+}
+
 func (it *Comparison) Clone() graph.Iterator {
-	out := NewComparison(it.subIt.Clone(), it.op, it.val, it.ts)
-	out.CopyTagsFrom(it)
+	out := NewComparison(it.subIt.Clone(), it.op, it.val, it.qs)
+	out.tags.CopyFrom(it)
 	return out
 }
 
-func (it *Comparison) Next() (graph.Value, bool) {
-	var val graph.Value
-	var ok bool
-	for {
-		val, ok = it.subIt.Next()
-		if !ok {
-			return nil, false
-		}
+func (it *Comparison) Next() bool {
+	for graph.Next(it.subIt) {
+		val := it.subIt.Result()
 		if it.doComparison(val) {
-			break
+			it.result = val
+			return true
 		}
 	}
-	it.Last = val
-	return val, ok
+	return false
 }
 
-func (it *Comparison) NextResult() bool {
+// DEPRECATED
+func (it *Comparison) ResultTree() *graph.ResultTree {
+	return graph.NewResultTree(it.Result())
+}
+
+func (it *Comparison) Result() graph.Value {
+	return it.result
+}
+
+func (it *Comparison) NextPath() bool {
 	for {
-		hasNext := it.subIt.NextResult()
+		hasNext := it.subIt.NextPath()
 		if !hasNext {
 			return false
 		}
 		if it.doComparison(it.subIt.Result()) {
-			return true
+			break
 		}
 	}
-	it.Last = it.subIt.Result()
+	it.result = it.subIt.Result()
 	return true
 }
 
-func (it *Comparison) Check(val graph.Value) bool {
+// No subiterators.
+func (it *Comparison) SubIterators() []graph.Iterator {
+	return nil
+}
+
+func (it *Comparison) Contains(val graph.Value) bool {
 	if !it.doComparison(val) {
 		return false
 	}
-	return it.subIt.Check(val)
+	return it.subIt.Contains(val)
 }
 
 // If we failed the check, then the subiterator should not contribute to the result
 // set. Otherwise, go ahead and tag it.
 func (it *Comparison) TagResults(dst map[string]graph.Value) {
-	it.Base.TagResults(dst)
+	for _, tag := range it.tags.Tags() {
+		dst[tag] = it.Result()
+	}
+
+	for tag, value := range it.tags.Fixed() {
+		dst[tag] = value
+	}
+
 	it.subIt.TagResults(dst)
 }
 
 // Registers the value-comparison iterator.
 func (it *Comparison) Type() graph.Type { return graph.Comparison }
 
-// Prints the value-comparison and its subiterator.
-func (it *Comparison) DebugString(indent int) string {
-	return fmt.Sprintf("%s(%s\n%s)",
-		strings.Repeat(" ", indent),
-		it.Type(), it.subIt.DebugString(indent+4))
+func (it *Comparison) Describe() graph.Description {
+	primary := it.subIt.Describe()
+	return graph.Description{
+		UID:      it.UID(),
+		Type:     it.Type(),
+		Iterator: &primary,
+	}
 }
 
 // There's nothing to optimize, locally, for a value-comparison iterator.
@@ -187,4 +213,8 @@ func (it *Comparison) Optimize() (graph.Iterator, bool) {
 // Again, optimized value comparison iterators should do better.
 func (it *Comparison) Stats() graph.IteratorStats {
 	return it.subIt.Stats()
+}
+
+func (it *Comparison) Size() (int64, bool) {
+	return 0, true
 }

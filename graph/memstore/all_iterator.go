@@ -21,26 +21,51 @@ import (
 
 type AllIterator struct {
 	iterator.Int64
-	ts *TripleStore
+	qs *QuadStore
 }
 
-func NewMemstoreAllIterator(ts *TripleStore) *AllIterator {
-	var out AllIterator
-	out.Int64 = *iterator.NewInt64(1, ts.idCounter-1)
-	out.ts = ts
+type (
+	nodesAllIterator AllIterator
+	quadsAllIterator AllIterator
+)
+
+func newNodesAllIterator(qs *QuadStore) *nodesAllIterator {
+	var out nodesAllIterator
+	out.Int64 = *iterator.NewInt64(1, qs.nextID-1)
+	out.qs = qs
 	return &out
 }
 
-func (it *AllIterator) Next() (graph.Value, bool) {
-	next, out := it.Int64.Next()
-	if !out {
-		return next, out
+// No subiterators.
+func (it *nodesAllIterator) SubIterators() []graph.Iterator {
+	return nil
+}
+
+func (it *nodesAllIterator) Next() bool {
+	if !it.Int64.Next() {
+		return false
 	}
-	i64 := next.(int64)
-	_, ok := it.ts.revIdMap[i64]
+	_, ok := it.qs.revIDMap[it.Int64.Result().(int64)]
 	if !ok {
 		return it.Next()
 	}
-	it.Last = next
-	return next, out
+	return true
+}
+
+func newQuadsAllIterator(qs *QuadStore) *quadsAllIterator {
+	var out quadsAllIterator
+	out.Int64 = *iterator.NewInt64(1, qs.nextQuadID-1)
+	out.qs = qs
+	return &out
+}
+
+func (it *quadsAllIterator) Next() bool {
+	out := it.Int64.Next()
+	if out {
+		i64 := it.Int64.Result().(int64)
+		if it.qs.log[i64].DeletedBy != 0 || it.qs.log[i64].Action == graph.Delete {
+			return it.Next()
+		}
+	}
+	return out
 }

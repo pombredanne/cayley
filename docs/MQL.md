@@ -14,7 +14,7 @@ Every JSON Object can be thought of as a node in the graph, and wrapping an obje
 
 Is equivalent to all nodes in the graph, where "id" is the special keyword for the value of the node.
 
-Predicates are added to the object to specify constraints. 
+Predicates are added to the object to specify constraints.
 
 ```json
 [{
@@ -40,7 +40,7 @@ Predicates always assume a forward direction. That is,
 }]
 ```
 
-will only match if the triple
+will only match if the quad
 ```
 A some_predicate B .
 ```
@@ -54,7 +54,7 @@ exists. In order to reverse the directions, "!predicates" are used. So that:
 }]
 ```
 
-will only match if the triple
+will only match if the quad
 ```
 B some_predicate A .
 ```
@@ -66,7 +66,7 @@ JSON does not specify the behavior of objects with the same key. In order to hav
 
 
 ```json
-[{ 
+[{
   "id": "A",
   "@x:some_predicate": "B",
   "@y:some_predicate": "C"

@@ -22,13 +22,13 @@ import (
 
 // Make sure that tags work on the And.
 func TestTag(t *testing.T) {
-	fix1 := newFixed()
+	fix1 := NewFixed(Identity)
 	fix1.Add(234)
-	fix1.AddTag("foo")
+	fix1.Tagger().Add("foo")
 	and := NewAnd()
 	and.AddSubIterator(fix1)
-	and.AddTag("bar")
-	out := fix1.Tags()
+	and.Tagger().Add("bar")
+	out := fix1.Tagger().Tags()
 	if len(out) != 1 {
 		t.Errorf("Expected length 1, got %d", len(out))
 	}
@@ -36,10 +36,10 @@ func TestTag(t *testing.T) {
 		t.Errorf("Cannot get tag back, got %s", out[0])
 	}
 
-	val, ok := and.Next()
-	if !ok {
+	if !and.Next() {
 		t.Errorf("And did not next")
 	}
+	val := and.Result()
 	if val != 234 {
 		t.Errorf("Unexpected value")
 	}
@@ -55,12 +55,12 @@ func TestTag(t *testing.T) {
 
 // Do a simple itersection of fixed values.
 func TestAndAndFixedIterators(t *testing.T) {
-	fix1 := newFixed()
+	fix1 := NewFixed(Identity)
 	fix1.Add(1)
 	fix1.Add(2)
 	fix1.Add(3)
 	fix1.Add(4)
-	fix2 := newFixed()
+	fix2 := NewFixed(Identity)
 	fix2.Add(3)
 	fix2.Add(4)
 	fix2.Add(5)
@@ -76,18 +76,15 @@ func TestAndAndFixedIterators(t *testing.T) {
 		t.Error("not accurate")
 	}
 
-	val, ok := and.Next()
-	if val != 3 || ok == false {
+	if !and.Next() || and.Result() != 3 {
 		t.Error("Incorrect first value")
 	}
 
-	val, ok = and.Next()
-	if val != 4 || ok == false {
+	if !and.Next() || and.Result() != 4 {
 		t.Error("Incorrect second value")
 	}
 
-	val, ok = and.Next()
-	if ok {
+	if and.Next() {
 		t.Error("Too many values")
 	}
 
@@ -96,12 +93,12 @@ func TestAndAndFixedIterators(t *testing.T) {
 // If there's no intersection, the size should still report the same,
 // but there should be nothing to Next()
 func TestNonOverlappingFixedIterators(t *testing.T) {
-	fix1 := newFixed()
+	fix1 := NewFixed(Identity)
 	fix1.Add(1)
 	fix1.Add(2)
 	fix1.Add(3)
 	fix1.Add(4)
-	fix2 := newFixed()
+	fix2 := NewFixed(Identity)
 	fix2.Add(5)
 	fix2.Add(6)
 	fix2.Add(7)
@@ -117,8 +114,7 @@ func TestNonOverlappingFixedIterators(t *testing.T) {
 		t.Error("not accurate")
 	}
 
-	_, ok := and.Next()
-	if ok {
+	if and.Next() {
 		t.Error("Too many values")
 	}
 
@@ -131,18 +127,15 @@ func TestAllIterators(t *testing.T) {
 	and.AddSubIterator(all2)
 	and.AddSubIterator(all1)
 
-	val, ok := and.Next()
-	if val.(int64) != 4 || ok == false {
+	if !and.Next() || and.Result() != int64(4) {
 		t.Error("Incorrect first value")
 	}
 
-	val, ok = and.Next()
-	if val.(int64) != 5 || ok == false {
+	if !and.Next() || and.Result() != int64(5) {
 		t.Error("Incorrect second value")
 	}
 
-	val, ok = and.Next()
-	if ok {
+	if and.Next() {
 		t.Error("Too many values")
 	}
 

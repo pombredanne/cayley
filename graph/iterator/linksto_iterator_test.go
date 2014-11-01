@@ -17,27 +17,27 @@ package iterator
 import (
 	"testing"
 
-	"github.com/google/cayley/graph"
+	"github.com/google/cayley/quad"
 )
 
 func TestLinksTo(t *testing.T) {
-	ts := &store{
+	qs := &store{
 		data: []string{1: "cool"},
-		iter: newFixed(),
+		iter: NewFixed(Identity),
 	}
-	ts.iter.(*Fixed).Add(2)
-	fixed := newFixed()
-	val := ts.ValueOf("cool")
+	qs.iter.(*Fixed).Add(2)
+	fixed := NewFixed(Identity)
+	val := qs.ValueOf("cool")
 	if val != 1 {
 		t.Fatalf("Failed to return correct value, got:%v expect:1", val)
 	}
 	fixed.Add(val)
-	lto := NewLinksTo(ts, fixed, graph.Object)
-	val, ok := lto.Next()
-	if !ok {
-		t.Error("At least one triple matches the fixed object")
+	lto := NewLinksTo(qs, fixed, quad.Object)
+	if !lto.Next() {
+		t.Error("At least one quad matches the fixed object")
 	}
+	val = lto.Result()
 	if val != 2 {
-		t.Errorf("Triple index 2, such as %s, should match %s", ts.Triple(2), ts.Triple(val))
+		t.Errorf("Quad index 2, such as %s, should match %s", qs.Quad(2), qs.Quad(val))
 	}
 }

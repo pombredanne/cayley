@@ -17,6 +17,7 @@ package http
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
@@ -24,50 +25,50 @@ import (
 	"github.com/barakmich/glog"
 	"github.com/julienschmidt/httprouter"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/nquads"
+	"github.com/google/cayley/quad"
+	"github.com/google/cayley/quad/cquads"
 )
 
-func ParseJsonToTripleList(jsonBody []byte) ([]*graph.Triple, error) {
-	var tripleList []*graph.Triple
-	err := json.Unmarshal(jsonBody, &tripleList)
+func ParseJSONToQuadList(jsonBody []byte) ([]quad.Quad, error) {
+	var quads []quad.Quad
+	err := json.Unmarshal(jsonBody, &quads)
 	if err != nil {
 		return nil, err
 	}
-	for i, t := range tripleList {
-		if !t.IsValid() {
-			return nil, fmt.Errorf("Invalid triple at index %d. %s", i, t)
+	for i, q := range quads {
+		if !q.IsValid() {
+			return nil, fmt.Errorf("invalid quad at index %d. %s", i, q)
 		}
 	}
-	return tripleList, nil
+	return quads, nil
 }
 
-func (api *Api) ServeV1Write(w http.ResponseWriter, r *http.Request, _ httprouter.Params) int {
+func (api *API) ServeV1Write(w http.ResponseWriter, r *http.Request, _ httprouter.Params) int {
 	if api.config.ReadOnly {
-		return FormatJson400(w, "Database is read-only.")
+		return jsonResponse(w, 400, "Database is read-only.")
 	}
 	bodyBytes, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		return FormatJson400(w, err)
+		return jsonResponse(w, 400, err)
 	}
-	tripleList, terr := ParseJsonToTripleList(bodyBytes)
-	if terr != nil {
-		return FormatJson400(w, terr)
+	quads, err := ParseJSONToQuadList(bodyBytes)
+	if err != nil {
+		return jsonResponse(w, 400, err)
 	}
-	api.ts.AddTripleSet(tripleList)
-	fmt.Fprintf(w, "{\"result\": \"Successfully wrote %d triples.\"}", len(tripleList))
+	api.handle.QuadWriter.AddQuadSet(quads)
+	fmt.Fprintf(w, "{\"result\": \"Successfully wrote %d quads.\"}", len(quads))
 	return 200
 }
 
-func (api *Api) ServeV1WriteNQuad(w http.ResponseWriter, r *http.Request, params httprouter.Params) int {
+func (api *API) ServeV1WriteNQuad(w http.ResponseWriter, r *http.Request, params httprouter.Params) int {
 	if api.config.ReadOnly {
-		return FormatJson400(w, "Database is read-only.")
+		return jsonResponse(w, 400, "Database is read-only.")
 	}
 
 	formFile, _, err := r.FormFile("NQuadFile")
 	if err != nil {
 		glog.Errorln(err)
-		return FormatJsonError(w, 500, "Couldn't read file: "+err.Error())
+		return jsonResponse(w, 500, "Couldn't read file: "+err.Error())
 	}
 
 	defer formFile.Close()
@@ -77,42 +78,53 @@ func (api *Api) ServeV1WriteNQuad(w http.ResponseWriter, r *http.Request, params
 		blockSize = int64(api.config.LoadSize)
 	}
 
-	tChan := make(chan *graph.Triple)
-	go nquads.ReadNQuadsFromReader(tChan, formFile)
-	tripleblock := make([]*graph.Triple, blockSize)
-	nTriples := 0
-	i := int64(0)
-	for t := range tChan {
-		tripleblock[i] = t
-		i++
-		nTriples++
-		if i == blockSize {
-			api.ts.AddTripleSet(tripleblock)
-			i = 0
+	// TODO(kortschak) Make this configurable from the web UI.
+	dec := cquads.NewDecoder(formFile)
+
+	var (
+		n int
+
+		block = make([]quad.Quad, 0, blockSize)
+	)
+	for {
+		t, err := dec.Unmarshal()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			panic("what can do this here?") // FIXME(kortschak)
+		}
+		block = append(block, t)
+		n++
+		if len(block) == cap(block) {
+			api.handle.QuadWriter.AddQuadSet(block)
+			block = block[:0]
 		}
 	}
-	api.ts.AddTripleSet(tripleblock[0:i])
-	fmt.Fprintf(w, "{\"result\": \"Successfully wrote %d triples.\"}", nTriples)
+	api.handle.QuadWriter.AddQuadSet(block)
+
+	fmt.Fprintf(w, "{\"result\": \"Successfully wrote %d quads.\"}", n)
+
 	return 200
 }
 
-func (api *Api) ServeV1Delete(w http.ResponseWriter, r *http.Request, params httprouter.Params) int {
+func (api *API) ServeV1Delete(w http.ResponseWriter, r *http.Request, params httprouter.Params) int {
 	if api.config.ReadOnly {
-		return FormatJson400(w, "Database is read-only.")
+		return jsonResponse(w, 400, "Database is read-only.")
 	}
 	bodyBytes, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		return FormatJson400(w, err)
+		return jsonResponse(w, 400, err)
 	}
-	tripleList, terr := ParseJsonToTripleList(bodyBytes)
-	if terr != nil {
-		return FormatJson400(w, terr)
+	quads, err := ParseJSONToQuadList(bodyBytes)
+	if err != nil {
+		return jsonResponse(w, 400, err)
 	}
 	count := 0
-	for _, triple := range tripleList {
-		api.ts.RemoveTriple(triple)
+	for _, q := range quads {
+		api.handle.QuadWriter.RemoveQuad(q)
 		count++
 	}
-	fmt.Fprintf(w, "{\"result\": \"Successfully deleted %d triples.\"}", count)
+	fmt.Fprintf(w, "{\"result\": \"Successfully deleted %d quads.\"}", count)
 	return 200
 }

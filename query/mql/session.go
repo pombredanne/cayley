@@ -23,55 +23,55 @@ import (
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/query"
 )
 
 type Session struct {
-	ts           graph.TripleStore
+	qs           graph.QuadStore
 	currentQuery *Query
 	debug        bool
 }
 
-func NewSession(ts graph.TripleStore) *Session {
+func NewSession(qs graph.QuadStore) *Session {
 	var m Session
-	m.ts = ts
+	m.qs = qs
 	return &m
 }
 
-func (m *Session) ToggleDebug() {
-	m.debug = !m.debug
+func (s *Session) ToggleDebug() {
+	s.debug = !s.debug
 }
 
-func (m *Session) GetQuery(input string, output_struct chan map[string]interface{}) {
-	defer close(output_struct)
+func (s *Session) GetQuery(input string, out chan map[string]interface{}) {
+	defer close(out)
 	var mqlQuery interface{}
 	err := json.Unmarshal([]byte(input), &mqlQuery)
 	if err != nil {
 		return
 	}
-	m.currentQuery = NewQuery(m)
-	m.currentQuery.BuildIteratorTree(mqlQuery)
+	s.currentQuery = NewQuery(s)
+	s.currentQuery.BuildIteratorTree(mqlQuery)
 	output := make(map[string]interface{})
-	iterator.OutputQueryShapeForIterator(m.currentQuery.it, m.ts, output)
-	nodes := output["nodes"].([]iterator.Node)
-	new_nodes := make([]iterator.Node, 0)
-	for _, n := range nodes {
+	iterator.OutputQueryShapeForIterator(s.currentQuery.it, s.qs, output)
+	nodes := make([]iterator.Node, 0)
+	for _, n := range output["nodes"].([]iterator.Node) {
 		n.Tags = nil
-		new_nodes = append(new_nodes, n)
+		nodes = append(nodes, n)
 	}
-	output["nodes"] = new_nodes
-	output_struct <- output
+	output["nodes"] = nodes
+	out <- output
 }
 
-func (s *Session) InputParses(input string) (graph.ParseResult, error) {
+func (s *Session) InputParses(input string) (query.ParseResult, error) {
 	var x interface{}
 	err := json.Unmarshal([]byte(input), &x)
 	if err != nil {
-		return graph.ParseFail, err
+		return query.ParseFail, err
 	}
-	return graph.Parsed, nil
+	return query.Parsed, nil
 }
 
-func (s *Session) ExecInput(input string, c chan interface{}, limit int) {
+func (s *Session) ExecInput(input string, c chan interface{}, _ int) {
 	defer close(c)
 	var mqlQuery interface{}
 	err := json.Unmarshal([]byte(input), &mqlQuery)
@@ -85,17 +85,18 @@ func (s *Session) ExecInput(input string, c chan interface{}, limit int) {
 	}
 	it, _ := s.currentQuery.it.Optimize()
 	if glog.V(2) {
-		glog.V(2).Infoln(it.DebugString(0))
-	}
-	for {
-		_, ok := it.Next()
-		if !ok {
-			break
+		b, err := json.MarshalIndent(it.Describe(), "", "  ")
+		if err != nil {
+			glog.Infof("failed to format description: %v", err)
+		} else {
+			glog.Infof("%s", b)
 		}
+	}
+	for graph.Next(it) {
 		tags := make(map[string]graph.Value)
 		it.TagResults(tags)
 		c <- tags
-		for it.NextResult() == true {
+		for it.NextPath() == true {
 			tags := make(map[string]graph.Value)
 			it.TagResults(tags)
 			c <- tags
@@ -112,7 +113,7 @@ func (s *Session) ToText(result interface{}) string {
 	r, _ := json.MarshalIndent(s.currentQuery.results, "", " ")
 	fmt.Println(string(r))
 	i := 0
-	for k, _ := range tags {
+	for k := range tags {
 		tagKeys[i] = string(k)
 		i++
 	}
@@ -121,25 +122,24 @@ func (s *Session) ToText(result interface{}) string {
 		if k == "$_" {
 			continue
 		}
-		out += fmt.Sprintf("%s : %s\n", k, s.ts.NameOf(tags[k]))
+		out += fmt.Sprintf("%s : %s\n", k, s.qs.NameOf(tags[k]))
 	}
 	return out
 }
 
-func (s *Session) BuildJson(result interface{}) {
+func (s *Session) BuildJSON(result interface{}) {
 	s.currentQuery.treeifyResult(result.(map[string]graph.Value))
 }
 
-func (s *Session) GetJson() (interface{}, error) {
+func (s *Session) GetJSON() ([]interface{}, error) {
 	s.currentQuery.buildResults()
 	if s.currentQuery.isError() {
 		return nil, s.currentQuery.err
-	} else {
-		return s.currentQuery.results, nil
 	}
+	return s.currentQuery.results, nil
 }
 
-func (s *Session) ClearJson() {
+func (s *Session) ClearJSON() {
 	// Since we create a new Query underneath every query, clearing isn't necessary.
 	return
 }

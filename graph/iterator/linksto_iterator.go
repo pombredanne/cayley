@@ -23,40 +23,45 @@ package iterator
 // LinksTo is therefore sensitive to growing with a fanout. (A small-sized
 // subiterator could cause LinksTo to be large).
 //
-// Check()ing a LinksTo means, given a link, take the direction we care about
+// Contains()ing a LinksTo means, given a link, take the direction we care about
 // and check if it's in our subiterator. Checking is therefore fairly cheap, and
 // similar to checking the subiterator alone.
 //
 // Can be seen as the dual of the HasA iterator.
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/google/cayley/graph"
+	"github.com/google/cayley/quad"
 )
 
-// A LinksTo has a reference back to the graph.TripleStore (to create the iterators
+// A LinksTo has a reference back to the graph.QuadStore (to create the iterators
 // for each node) the subiterator, and the direction the iterator comes from.
 // `next_it` is the tempoarary iterator held per result in `primary_it`.
 type LinksTo struct {
-	Base
-	ts        graph.TripleStore
+	uid       uint64
+	tags      graph.Tagger
+	qs        graph.QuadStore
 	primaryIt graph.Iterator
-	dir       graph.Direction
+	dir       quad.Direction
 	nextIt    graph.Iterator
+	result    graph.Value
+	runstats  graph.IteratorStats
 }
 
 // Construct a new LinksTo iterator around a direction and a subiterator of
 // nodes.
-func NewLinksTo(ts graph.TripleStore, it graph.Iterator, d graph.Direction) *LinksTo {
-	var lto LinksTo
-	BaseInit(&lto.Base)
-	lto.ts = ts
-	lto.primaryIt = it
-	lto.dir = d
-	lto.nextIt = &Null{}
-	return &lto
+func NewLinksTo(qs graph.QuadStore, it graph.Iterator, d quad.Direction) *LinksTo {
+	return &LinksTo{
+		uid:       NextUID(),
+		qs:        qs,
+		primaryIt: it,
+		dir:       d,
+		nextIt:    &Null{},
+	}
+}
+
+func (it *LinksTo) UID() uint64 {
+	return it.uid
 }
 
 func (it *LinksTo) Reset() {
@@ -67,18 +72,29 @@ func (it *LinksTo) Reset() {
 	it.nextIt = &Null{}
 }
 
+func (it *LinksTo) Tagger() *graph.Tagger {
+	return &it.tags
+}
+
 func (it *LinksTo) Clone() graph.Iterator {
-	out := NewLinksTo(it.ts, it.primaryIt.Clone(), it.dir)
-	out.CopyTagsFrom(it)
+	out := NewLinksTo(it.qs, it.primaryIt.Clone(), it.dir)
+	out.tags.CopyFrom(it)
 	return out
 }
 
 // Return the direction under consideration.
-func (it *LinksTo) Direction() graph.Direction { return it.dir }
+func (it *LinksTo) Direction() quad.Direction { return it.dir }
 
 // Tag these results, and our subiterator's results.
 func (it *LinksTo) TagResults(dst map[string]graph.Value) {
-	it.Base.TagResults(dst)
+	for _, tag := range it.tags.Tags() {
+		dst[tag] = it.Result()
+	}
+
+	for tag, value := range it.tags.Fixed() {
+		dst[tag] = value
+	}
+
 	it.primaryIt.TagResults(dst)
 }
 
@@ -89,23 +105,27 @@ func (it *LinksTo) ResultTree() *graph.ResultTree {
 	return tree
 }
 
-// Print the iterator.
-func (it *LinksTo) DebugString(indent int) string {
-	return fmt.Sprintf("%s(%s %d direction:%s\n%s)",
-		strings.Repeat(" ", indent),
-		it.Type(), it.UID(), it.dir, it.primaryIt.DebugString(indent+4))
+func (it *LinksTo) Describe() graph.Description {
+	primary := it.primaryIt.Describe()
+	return graph.Description{
+		UID:       it.UID(),
+		Type:      it.Type(),
+		Direction: it.dir,
+		Iterator:  &primary,
+	}
 }
 
 // If it checks in the right direction for the subiterator, it is a valid link
 // for the LinksTo.
-func (it *LinksTo) Check(val graph.Value) bool {
-	graph.CheckLogIn(it, val)
-	node := it.ts.TripleDirection(val, it.dir)
-	if it.primaryIt.Check(node) {
-		it.Last = val
-		return graph.CheckLogOut(it, val, true)
+func (it *LinksTo) Contains(val graph.Value) bool {
+	graph.ContainsLogIn(it, val)
+	it.runstats.Contains += 1
+	node := it.qs.QuadDirection(val, it.dir)
+	if it.primaryIt.Contains(node) {
+		it.result = val
+		return graph.ContainsLogOut(it, val, true)
 	}
-	return graph.CheckLogOut(it, val, false)
+	return graph.ContainsLogOut(it, val, false)
 }
 
 // Return a list containing only our subiterator.
@@ -123,10 +143,10 @@ func (it *LinksTo) Optimize() (graph.Iterator, bool) {
 			return it.primaryIt, true
 		}
 	}
-	// Ask the graph.TripleStore if we can be replaced. Often times, this is a great
+	// Ask the graph.QuadStore if we can be replaced. Often times, this is a great
 	// optimization opportunity (there's a fixed iterator underneath us, for
 	// example).
-	newReplacement, hasOne := it.ts.OptimizeIterator(it)
+	newReplacement, hasOne := it.qs.OptimizeIterator(it)
 	if hasOne {
 		it.Close()
 		return newReplacement, true
@@ -135,23 +155,29 @@ func (it *LinksTo) Optimize() (graph.Iterator, bool) {
 }
 
 // Next()ing a LinksTo operates as described above.
-func (it *LinksTo) Next() (graph.Value, bool) {
+func (it *LinksTo) Next() bool {
 	graph.NextLogIn(it)
-	val, ok := it.nextIt.Next()
-	if !ok {
-		// Subiterator is empty, get another one
-		candidate, ok := it.primaryIt.Next()
-		if !ok {
-			// We're out of nodes in our subiterator, so we're done as well.
-			return graph.NextLogOut(it, 0, false)
-		}
-		it.nextIt.Close()
-		it.nextIt = it.ts.TripleIterator(it.dir, candidate)
-		// Recurse -- return the first in the next set.
-		return it.Next()
+	it.runstats.Next += 1
+	if graph.Next(it.nextIt) {
+		it.runstats.ContainsNext += 1
+		it.result = it.nextIt.Result()
+		return graph.NextLogOut(it, it.nextIt, true)
 	}
-	it.Last = val
-	return graph.NextLogOut(it, val, ok)
+
+	// Subiterator is empty, get another one
+	if !graph.Next(it.primaryIt) {
+		// We're out of nodes in our subiterator, so we're done as well.
+		return graph.NextLogOut(it, 0, false)
+	}
+	it.nextIt.Close()
+	it.nextIt = it.qs.QuadIterator(it.dir, it.primaryIt.Result())
+
+	// Recurse -- return the first in the next set.
+	return it.Next()
+}
+
+func (it *LinksTo) Result() graph.Value {
+	return it.result
 }
 
 // Close our subiterators.
@@ -161,8 +187,8 @@ func (it *LinksTo) Close() {
 }
 
 // We won't ever have a new result, but our subiterators might.
-func (it *LinksTo) NextResult() bool {
-	return it.primaryIt.NextResult()
+func (it *LinksTo) NextPath() bool {
+	return it.primaryIt.NextPath()
 }
 
 // Register the LinksTo.
@@ -171,13 +197,20 @@ func (it *LinksTo) Type() graph.Type { return graph.LinksTo }
 // Return a guess as to how big or costly it is to next the iterator.
 func (it *LinksTo) Stats() graph.IteratorStats {
 	subitStats := it.primaryIt.Stats()
-	// TODO(barakmich): These should really come from the triplestore itself
+	// TODO(barakmich): These should really come from the quadstore itself
 	fanoutFactor := int64(20)
 	checkConstant := int64(1)
 	nextConstant := int64(2)
 	return graph.IteratorStats{
-		NextCost:  nextConstant + subitStats.NextCost,
-		CheckCost: checkConstant + subitStats.CheckCost,
-		Size:      fanoutFactor * subitStats.Size,
+		NextCost:     nextConstant + subitStats.NextCost,
+		ContainsCost: checkConstant + subitStats.ContainsCost,
+		Size:         fanoutFactor * subitStats.Size,
+		Next:         it.runstats.Next,
+		Contains:     it.runstats.Contains,
+		ContainsNext: it.runstats.ContainsNext,
 	}
+}
+
+func (it *LinksTo) Size() (int64, bool) {
+	return it.Stats().Size, false
 }

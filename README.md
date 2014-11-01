@@ -1,18 +1,20 @@
 <p align="center">
   <img src="static/branding/cayley_side.png?raw=true" alt="Cayley" />
 </p>
-Cayley is an open-source graph inspired by the graph database behind [Freebase](http://freebase.com) and Google's [Knowledge Graph](http://www.google.com/insidesearch/features/search/knowledge.html). 
+Cayley is an open-source graph inspired by the graph database behind [Freebase](http://freebase.com) and Google's [Knowledge Graph](http://www.google.com/insidesearch/features/search/knowledge.html).
 
 Its goal is to be a part of the developer's toolbox where [Linked Data](http://linkeddata.org/) and graph-shaped data (semantic webs, social networks, etc) in general are concerned.
 
 [![Build Status](https://travis-ci.org/google/cayley.png?branch=master)](https://travis-ci.org/google/cayley)
 
 ## What's new?
-* 2014-07-12:
-  * Massive cleanup and restructuring is largely done, it should be even easier to add to Cayley. (thanks @kortschak)
-  * A couple new backends are in progress, namely Postgres and Cassandra -- PRs when they come around.
-  * Cayley is [now in Homebrew](https://github.com/Homebrew/homebrew/commit/1bd2fb2a61c7101a8c79c05afc90eeb02e9aa240), thanks to @whitlockjc
-  * Our first client API (for Clojure, thanks to @wjb) -- list is now started on the [Client API wiki page](https://github.com/google/cayley/wiki/Client-APIs)
+* 2014-08-06:
+  * 0.3.1 Binary Release including:
+    * New Quad Parser (more strictly passing the [W3C spec](http://www.w3.org/TR/n-quads) and test suite)
+    * Automatic decompression of quad files
+  * Ruby and a Node.JS [client libraries](https://github.com/google/cayley/wiki/Client-APIs) from the community.
+  * Benchmarks
+  * [Large speedups on HEAD](https://github.com/google/cayley/pull/101) (in for the next binary release)
 
 ## Features
 
@@ -25,14 +27,15 @@ Its goal is to be a part of the developer's toolbox where [Linked Data](http://l
   * JavaScript, with a [Gremlin](http://gremlindocs.com/)-inspired\* graph object.
   * (simplified) [MQL](https://developers.google.com/freebase/v1/mql-overview), for Freebase fans
 * Plays well with multiple backend stores:
-  * [LevelDB](http://code.google.com/p/leveldb/) for single-machine storage
-  * [MongoDB](http://mongodb.org)
+  * [LevelDB](http://code.google.com/p/leveldb/)
+  * [Bolt](http://github.com/boltdb/bolt)
+  * [MongoDB](http://mongodb.org) for distributed stores
   * In-memory, ephemeral
 * Modular design; easy to extend with new languages and backends
 * Good test coverage
 * Speed, where possible.
 
-Rough performance testing shows that, on consumer hardware and an average disk, 134m triples in LevelDB is no problem and a multi-hop intersection query -- films starring X and Y -- takes ~150ms.
+Rough performance testing shows that, on consumer hardware and an average disk, 134m quads in LevelDB is no problem and a multi-hop intersection query -- films starring X and Y -- takes ~150ms.
 
 \* Note that while it's not exactly Gremlin, it certainly takes inspiration from that API. For this flavor, [see the documentation](docs/GremlinAPI.md).
 
@@ -44,7 +47,7 @@ If you prefer to build from source, see the documentation on the wiki at [How to
 
 `cd` to the directory and give it a quick test with:
 ```
-./cayley repl --dbpath=testdata.nt 
+./cayley repl --dbpath=testdata.nq
 ```
 
 You should see a `cayley>` REPL prompt. Go ahead and give it a try:
@@ -69,17 +72,16 @@ cayley> graph.Vertex("dani").Out("follows").All()
 
 **Sample Data**
 
-For somewhat more interesting data, a sample of 30k movies from Freebase comes in the checkout. 
+For somewhat more interesting data, a sample of 30k movies from Freebase comes in the checkout.
 
 ```
-gzip -cd 30kmoviedata.nt.gz > 30kmovies.nt
-./cayley repl --dbpath=30kmovies.nt
+./cayley repl --dbpath=30kmoviedata.nq.gz
 ```
 
-To run the web frontend, replace the "repl" command with "http" 
+To run the web frontend, replace the "repl" command with "http"
 
 ```
-./cayley http --dbpath=30kmovies.nt
+./cayley http --dbpath=30kmoviedata.nq.gz
 ```
 
 And visit port 64210 on your machine, commonly [http://localhost:64210](http://localhost:64210)
@@ -89,15 +91,15 @@ And visit port 64210 on your machine, commonly [http://localhost:64210](http://l
 
 The default environment is based on [Gremlin](http://gremlindocs.com/) and is simply a JavaScript environment. If you can write jQuery, you can query a graph.
 
-You'll notice we have a special object, `graph` or `g`, which is how you can interact with the graph. 
+You'll notice we have a special object, `graph` or `g`, which is how you can interact with the graph.
 
-The simplest query is merely to return a single vertex. Using the 30kmovies.nt dataset from above, let's walk through some simple queries:
+The simplest query is merely to return a single vertex. Using the 30kmoviedata.nq dataset from above, let's walk through some simple queries:
 
 ```javascript
 // Query all vertices in the graph, limit to the first 5 vertices found.
 graph.Vertex().GetLimit(5)
 
-// Start with only one vertex, the literal name "Humphrey Bogart", and retreive all of them.
+// Start with only one vertex, the literal name "Humphrey Bogart", and retrieve all of them.
 graph.Vertex("Humphrey Bogart").All()
 
 // `g` and `V` are synonyms for `graph` and `Vertex` respectively, as they are quite common.
@@ -107,7 +109,7 @@ g.V("Humphrey Bogart").All()
 // Follow links that are pointing In to our "Humphrey Bogart" node with the predicate "name".
 g.V("Humphrey Bogart").In("name").All()
 
-// Notice that "name" is a generic predicate in our dataset. 
+// Notice that "name" is a generic predicate in our dataset.
 // Starting with a movie gives a similar effect.
 g.V("Casablanca").In("name").All()
 
@@ -129,7 +131,7 @@ And these pipelines continue...
 g.V().Has("name","Casablanca")
   .Out("/film/film/starring").Out("/film/performance/actor")
   .Out("name").All()
-  
+
 // But this is starting to get long. Let's use a morphism -- a pre-defined path stored in a variable -- as our linkage
 
 var filmToActor = g.Morphism().Out("/film/film/starring").Out("/film/performance/actor")

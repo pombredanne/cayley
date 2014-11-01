@@ -16,53 +16,70 @@ package leveldb
 
 import (
 	"bytes"
-	"fmt"
-	"strings"
+	"encoding/json"
 
+	"github.com/barakmich/glog"
 	ldbit "github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/quad"
 )
 
 type Iterator struct {
-	iterator.Base
+	uid            uint64
+	tags           graph.Tagger
 	nextPrefix     []byte
-	checkId        []byte
-	dir            graph.Direction
+	checkID        []byte
+	dir            quad.Direction
 	open           bool
 	iter           ldbit.Iterator
-	ts             *TripleStore
+	qs             *QuadStore
 	ro             *opt.ReadOptions
 	originalPrefix string
+	result         graph.Value
 }
 
-func NewIterator(prefix string, d graph.Direction, value graph.Value, ts *TripleStore) *Iterator {
-	var it Iterator
-	iterator.BaseInit(&it.Base)
-	it.checkId = value.([]byte)
-	it.dir = d
-	it.originalPrefix = prefix
-	it.nextPrefix = make([]byte, 0, 2+ts.hasher.Size())
-	it.nextPrefix = append(it.nextPrefix, []byte(prefix)...)
-	it.nextPrefix = append(it.nextPrefix, []byte(it.checkId[1:])...)
-	it.ro = &opt.ReadOptions{}
-	it.ro.DontFillCache = true
-	it.iter = ts.db.NewIterator(nil, it.ro)
-	it.open = true
-	it.ts = ts
+func NewIterator(prefix string, d quad.Direction, value graph.Value, qs *QuadStore) *Iterator {
+	vb := value.(Token)
+	p := make([]byte, 0, 2+hashSize)
+	p = append(p, []byte(prefix)...)
+	p = append(p, []byte(vb[1:])...)
+
+	opts := &opt.ReadOptions{
+		DontFillCache: true,
+	}
+
+	it := Iterator{
+		uid:            iterator.NextUID(),
+		nextPrefix:     p,
+		checkID:        vb,
+		dir:            d,
+		originalPrefix: prefix,
+		ro:             opts,
+		iter:           qs.db.NewIterator(nil, opts),
+		open:           true,
+		qs:             qs,
+	}
+
 	ok := it.iter.Seek(it.nextPrefix)
 	if !ok {
 		it.open = false
 		it.iter.Release()
+		glog.Error("Opening LevelDB iterator couldn't seek to location ", it.nextPrefix)
 	}
+
 	return &it
+}
+
+func (it *Iterator) UID() uint64 {
+	return it.uid
 }
 
 func (it *Iterator) Reset() {
 	if !it.open {
-		it.iter = it.ts.db.NewIterator(nil, it.ro)
+		it.iter = it.qs.db.NewIterator(nil, it.ro)
 		it.open = true
 	}
 	ok := it.iter.Seek(it.nextPrefix)
@@ -72,9 +89,23 @@ func (it *Iterator) Reset() {
 	}
 }
 
+func (it *Iterator) Tagger() *graph.Tagger {
+	return &it.tags
+}
+
+func (it *Iterator) TagResults(dst map[string]graph.Value) {
+	for _, tag := range it.tags.Tags() {
+		dst[tag] = it.Result()
+	}
+
+	for tag, value := range it.tags.Fixed() {
+		dst[tag] = value
+	}
+}
+
 func (it *Iterator) Clone() graph.Iterator {
-	out := NewIterator(it.originalPrefix, it.dir, it.checkId, it.ts)
-	out.CopyTagsFrom(it)
+	out := NewIterator(it.originalPrefix, it.dir, Token(it.checkID), it.qs)
+	out.tags.CopyFrom(it)
 	return out
 }
 
@@ -85,120 +116,154 @@ func (it *Iterator) Close() {
 	}
 }
 
-func (it *Iterator) Next() (graph.Value, bool) {
+func (it *Iterator) isLiveValue(val []byte) bool {
+	var entry IndexEntry
+	json.Unmarshal(val, &entry)
+	return len(entry.History)%2 != 0
+}
+
+func (it *Iterator) Next() bool {
 	if it.iter == nil {
-		it.Last = nil
-		return nil, false
+		it.result = nil
+		return false
 	}
 	if !it.open {
-		it.Last = nil
-		return nil, false
+		it.result = nil
+		return false
 	}
 	if !it.iter.Valid() {
-		it.Last = nil
+		it.result = nil
 		it.Close()
-		return nil, false
+		return false
 	}
 	if bytes.HasPrefix(it.iter.Key(), it.nextPrefix) {
+		if !it.isLiveValue(it.iter.Value()) {
+			return it.Next()
+		}
 		out := make([]byte, len(it.iter.Key()))
 		copy(out, it.iter.Key())
-		it.Last = out
+		it.result = Token(out)
 		ok := it.iter.Next()
 		if !ok {
 			it.Close()
 		}
-		return out, true
+		return true
 	}
 	it.Close()
-	it.Last = nil
-	return nil, false
+	it.result = nil
+	return false
 }
 
-func PositionOf(prefix []byte, d graph.Direction, ts *TripleStore) int {
+func (it *Iterator) ResultTree() *graph.ResultTree {
+	return graph.NewResultTree(it.Result())
+}
+
+func (it *Iterator) Result() graph.Value {
+	return it.result
+}
+
+func (it *Iterator) NextPath() bool {
+	return false
+}
+
+// No subiterators.
+func (it *Iterator) SubIterators() []graph.Iterator {
+	return nil
+}
+
+func PositionOf(prefix []byte, d quad.Direction, qs *QuadStore) int {
 	if bytes.Equal(prefix, []byte("sp")) {
 		switch d {
-		case graph.Subject:
+		case quad.Subject:
 			return 2
-		case graph.Predicate:
-			return ts.hasher.Size() + 2
-		case graph.Object:
-			return 2*ts.hasher.Size() + 2
-		case graph.Provenance:
-			return -1
+		case quad.Predicate:
+			return hashSize + 2
+		case quad.Object:
+			return 2*hashSize + 2
+		case quad.Label:
+			return 3*hashSize + 2
 		}
 	}
 	if bytes.Equal(prefix, []byte("po")) {
 		switch d {
-		case graph.Subject:
-			return 2*ts.hasher.Size() + 2
-		case graph.Predicate:
+		case quad.Subject:
+			return 2*hashSize + 2
+		case quad.Predicate:
 			return 2
-		case graph.Object:
-			return ts.hasher.Size() + 2
-		case graph.Provenance:
-			return -1
+		case quad.Object:
+			return hashSize + 2
+		case quad.Label:
+			return hashSize + 2
 		}
 	}
 	if bytes.Equal(prefix, []byte("os")) {
 		switch d {
-		case graph.Subject:
-			return ts.hasher.Size() + 2
-		case graph.Predicate:
-			return 2*ts.hasher.Size() + 2
-		case graph.Object:
+		case quad.Subject:
+			return hashSize + 2
+		case quad.Predicate:
+			return 2*hashSize + 2
+		case quad.Object:
 			return 2
-		case graph.Provenance:
-			return -1
+		case quad.Label:
+			return 3*hashSize + 2
 		}
 	}
 	if bytes.Equal(prefix, []byte("cp")) {
 		switch d {
-		case graph.Subject:
-			return 2*ts.hasher.Size() + 2
-		case graph.Predicate:
-			return ts.hasher.Size() + 2
-		case graph.Object:
-			return 3*ts.hasher.Size() + 2
-		case graph.Provenance:
+		case quad.Subject:
+			return 2*hashSize + 2
+		case quad.Predicate:
+			return hashSize + 2
+		case quad.Object:
+			return 3*hashSize + 2
+		case quad.Label:
 			return 2
 		}
 	}
 	panic("unreachable")
 }
 
-func (it *Iterator) Check(v graph.Value) bool {
-	val := v.([]byte)
+func (it *Iterator) Contains(v graph.Value) bool {
+	val := v.(Token)
 	if val[0] == 'z' {
 		return false
 	}
-	offset := PositionOf(val[0:2], it.dir, it.ts)
-	if offset != -1 {
-		if bytes.HasPrefix(val[offset:], it.checkId[1:]) {
-			return true
-		}
-	} else {
-		nameForDir := it.ts.Triple(v).Get(it.dir)
-		hashForDir := it.ts.ValueOf(nameForDir).([]byte)
-		if bytes.Equal(hashForDir, it.checkId) {
-			return true
-		}
+	offset := PositionOf(val[0:2], it.dir, it.qs)
+	if bytes.HasPrefix(val[offset:], it.checkID[1:]) {
+		// You may ask, why don't we check to see if it's a valid (not deleted) quad
+		// again?
+		//
+		// We've already done that -- in order to get the graph.Value token in the
+		// first place, we had to have done the check already; it came from a Next().
+		//
+		// However, if it ever starts coming from somewhere else, it'll be more
+		// efficient to change the interface of the graph.Value for LevelDB to a
+		// struct with a flag for isValid, to save another random read.
+		return true
 	}
 	return false
 }
 
 func (it *Iterator) Size() (int64, bool) {
-	return it.ts.SizeOf(it.checkId), true
+	return it.qs.SizeOf(Token(it.checkID)), true
 }
 
-func (it *Iterator) DebugString(indent int) string {
+func (it *Iterator) Describe() graph.Description {
 	size, _ := it.Size()
-	return fmt.Sprintf("%s(%s %d tags: %v dir: %s size:%d %s)", strings.Repeat(" ", indent), it.Type(), it.UID(), it.Tags(), it.dir, size, it.ts.NameOf(it.checkId))
+	return graph.Description{
+		UID:       it.UID(),
+		Name:      it.qs.NameOf(Token(it.checkID)),
+		Type:      it.Type(),
+		Tags:      it.tags.Tags(),
+		Size:      size,
+		Direction: it.dir,
+	}
 }
 
 var levelDBType graph.Type
 
 func init() {
-	levelDBType = graph.Register("leveldb")
+	levelDBType = graph.RegisterIterator("leveldb")
 }
 
 func Type() graph.Type { return levelDBType }
@@ -213,8 +278,8 @@ func (it *Iterator) Optimize() (graph.Iterator, bool) {
 func (it *Iterator) Stats() graph.IteratorStats {
 	s, _ := it.Size()
 	return graph.IteratorStats{
-		CheckCost: 1,
-		NextCost:  2,
-		Size:      s,
+		ContainsCost: 1,
+		NextCost:     2,
+		Size:         s,
 	}
 }

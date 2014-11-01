@@ -15,96 +15,163 @@
 package memstore
 
 import (
-	"fmt"
 	"math"
-	"strings"
-
-	"github.com/petar/GoLLRB/llrb"
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/graph/memstore/b"
 )
 
 type Iterator struct {
-	iterator.Base
-	tree      *llrb.LLRB
-	data      string
-	isRunning bool
-	iterLast  Int64
+	uid    uint64
+	qs     *QuadStore
+	tags   graph.Tagger
+	tree   *b.Tree
+	iter   *b.Enumerator
+	data   string
+	result graph.Value
 }
 
-type Int64 int64
-
-func (i Int64) Less(than llrb.Item) bool {
-	return i < than.(Int64)
+func cmp(a, b int64) int {
+	return int(a - b)
 }
 
-func IterateOne(tree *llrb.LLRB, last Int64) Int64 {
-	var next Int64
-	tree.AscendGreaterOrEqual(last, func(i llrb.Item) bool {
-		if i.(Int64) == last {
-			return true
-		} else {
-			next = i.(Int64)
-			return false
-		}
-	})
-	return next
+func NewIterator(tree *b.Tree, data string, qs *QuadStore) *Iterator {
+	iter, err := tree.SeekFirst()
+	if err != nil {
+		iter = nil
+	}
+	return &Iterator{
+		uid:  iterator.NextUID(),
+		qs:   qs,
+		tree: tree,
+		iter: iter,
+		data: data,
+	}
 }
 
-func NewLlrbIterator(tree *llrb.LLRB, data string) *Iterator {
-	var it Iterator
-	iterator.BaseInit(&it.Base)
-	it.tree = tree
-	it.iterLast = Int64(-1)
-	it.data = data
-	return &it
+func (it *Iterator) UID() uint64 {
+	return it.uid
 }
 
 func (it *Iterator) Reset() {
-	it.iterLast = Int64(-1)
+	var err error
+	it.iter, err = it.tree.SeekFirst()
+	if err != nil {
+		it.iter = nil
+	}
+}
+
+func (it *Iterator) Tagger() *graph.Tagger {
+	return &it.tags
+}
+
+func (it *Iterator) TagResults(dst map[string]graph.Value) {
+	for _, tag := range it.tags.Tags() {
+		dst[tag] = it.Result()
+	}
+
+	for tag, value := range it.tags.Fixed() {
+		dst[tag] = value
+	}
 }
 
 func (it *Iterator) Clone() graph.Iterator {
-	var new_it = NewLlrbIterator(it.tree, it.data)
-	new_it.CopyTagsFrom(it)
-	return new_it
+	var iter *b.Enumerator
+	if it.result != nil {
+		var ok bool
+		iter, ok = it.tree.Seek(it.result.(int64))
+		if !ok {
+			panic("value unexpectedly missing")
+		}
+	} else {
+		var err error
+		iter, err = it.tree.SeekFirst()
+		if err != nil {
+			iter = nil
+		}
+	}
+
+	m := &Iterator{
+		uid:  iterator.NextUID(),
+		qs:   it.qs,
+		tree: it.tree,
+		iter: iter,
+		data: it.data,
+	}
+	m.tags.CopyFrom(it)
+
+	return m
 }
 
 func (it *Iterator) Close() {}
 
-func (it *Iterator) Next() (graph.Value, bool) {
+func (it *Iterator) checkValid(index int64) bool {
+	return it.qs.log[index].DeletedBy == 0
+}
+
+func (it *Iterator) Next() bool {
 	graph.NextLogIn(it)
-	if it.tree.Max() == nil || it.Last == int64(it.tree.Max().(Int64)) {
+
+	if it.iter == nil {
 		return graph.NextLogOut(it, nil, false)
 	}
-	it.iterLast = IterateOne(it.tree, it.iterLast)
-	it.Last = int64(it.iterLast)
-	return graph.NextLogOut(it, it.Last, true)
+	result, _, err := it.iter.Next()
+	if err != nil {
+		return graph.NextLogOut(it, nil, false)
+	}
+	if !it.checkValid(result) {
+		return it.Next()
+	}
+	it.result = result
+	return graph.NextLogOut(it, it.result, true)
+}
+
+func (it *Iterator) ResultTree() *graph.ResultTree {
+	return graph.NewResultTree(it.Result())
+}
+
+func (it *Iterator) Result() graph.Value {
+	return it.result
+}
+
+func (it *Iterator) NextPath() bool {
+	return false
+}
+
+// No subiterators.
+func (it *Iterator) SubIterators() []graph.Iterator {
+	return nil
 }
 
 func (it *Iterator) Size() (int64, bool) {
 	return int64(it.tree.Len()), true
 }
 
-func (it *Iterator) Check(v graph.Value) bool {
-	graph.CheckLogIn(it, v)
-	if it.tree.Has(Int64(v.(int64))) {
-		it.Last = v
-		return graph.CheckLogOut(it, v, true)
+func (it *Iterator) Contains(v graph.Value) bool {
+	graph.ContainsLogIn(it, v)
+	if _, ok := it.tree.Get(v.(int64)); ok {
+		it.result = v
+		return graph.ContainsLogOut(it, v, true)
 	}
-	return graph.CheckLogOut(it, v, false)
+	return graph.ContainsLogOut(it, v, false)
 }
 
-func (it *Iterator) DebugString(indent int) string {
+func (it *Iterator) Describe() graph.Description {
 	size, _ := it.Size()
-	return fmt.Sprintf("%s(%s tags:%s size:%d %s)", strings.Repeat(" ", indent), it.Type(), it.Tags(), size, it.data)
+	return graph.Description{
+		UID:  it.UID(),
+		Name: it.data,
+		Type: it.Type(),
+		Tags: it.tags.Tags(),
+		Size: size,
+	}
 }
 
 var memType graph.Type
 
 func init() {
-	memType = graph.Register("llrb")
+	memType = graph.RegisterIterator("b+tree")
 }
 
 func Type() graph.Type { return memType }
@@ -119,8 +186,8 @@ func (it *Iterator) Optimize() (graph.Iterator, bool) {
 
 func (it *Iterator) Stats() graph.IteratorStats {
 	return graph.IteratorStats{
-		CheckCost: int64(math.Log(float64(it.tree.Len()))) + 1,
-		NextCost:  1,
-		Size:      int64(it.tree.Len()),
+		ContainsCost: int64(math.Log(float64(it.tree.Len()))) + 1,
+		NextCost:     1,
+		Size:         int64(it.tree.Len()),
 	}
 }

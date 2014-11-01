@@ -16,47 +16,60 @@ package leveldb
 
 import (
 	"bytes"
-	"fmt"
-	"strings"
 
 	ldbit "github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/quad"
 )
 
 type AllIterator struct {
-	iterator.Base
+	uid    uint64
+	tags   graph.Tagger
 	prefix []byte
-	dir    graph.Direction
+	dir    quad.Direction
 	open   bool
 	iter   ldbit.Iterator
-	ts     *TripleStore
+	qs     *QuadStore
 	ro     *opt.ReadOptions
+	result graph.Value
 }
 
-func NewAllIterator(prefix string, d graph.Direction, ts *TripleStore) *AllIterator {
-	var it AllIterator
-	iterator.BaseInit(&it.Base)
-	it.ro = &opt.ReadOptions{}
-	it.ro.DontFillCache = true
-	it.iter = ts.db.NewIterator(nil, it.ro)
-	it.prefix = []byte(prefix)
-	it.dir = d
-	it.open = true
-	it.ts = ts
+func NewAllIterator(prefix string, d quad.Direction, qs *QuadStore) *AllIterator {
+	opts := &opt.ReadOptions{
+		DontFillCache: true,
+	}
+
+	it := AllIterator{
+		uid:    iterator.NextUID(),
+		ro:     opts,
+		iter:   qs.db.NewIterator(nil, opts),
+		prefix: []byte(prefix),
+		dir:    d,
+		open:   true,
+		qs:     qs,
+	}
+
 	it.iter.Seek(it.prefix)
 	if !it.iter.Valid() {
+		// FIXME(kortschak) What are the semantics here? Is this iterator usable?
+		// If not, we should return nil *Iterator and an error.
 		it.open = false
 		it.iter.Release()
 	}
+
 	return &it
+}
+
+func (it *AllIterator) UID() uint64 {
+	return it.uid
 }
 
 func (it *AllIterator) Reset() {
 	if !it.open {
-		it.iter = it.ts.db.NewIterator(nil, it.ro)
+		it.iter = it.qs.db.NewIterator(nil, it.ro)
 		it.open = true
 	}
 	it.iter.Seek(it.prefix)
@@ -66,16 +79,30 @@ func (it *AllIterator) Reset() {
 	}
 }
 
+func (it *AllIterator) Tagger() *graph.Tagger {
+	return &it.tags
+}
+
+func (it *AllIterator) TagResults(dst map[string]graph.Value) {
+	for _, tag := range it.tags.Tags() {
+		dst[tag] = it.Result()
+	}
+
+	for tag, value := range it.tags.Fixed() {
+		dst[tag] = value
+	}
+}
+
 func (it *AllIterator) Clone() graph.Iterator {
-	out := NewAllIterator(string(it.prefix), it.dir, it.ts)
-	out.CopyTagsFrom(it)
+	out := NewAllIterator(string(it.prefix), it.dir, it.qs)
+	out.tags.CopyFrom(it)
 	return out
 }
 
-func (it *AllIterator) Next() (graph.Value, bool) {
+func (it *AllIterator) Next() bool {
 	if !it.open {
-		it.Last = nil
-		return nil, false
+		it.result = nil
+		return false
 	}
 	var out []byte
 	out = make([]byte, len(it.iter.Key()))
@@ -86,14 +113,31 @@ func (it *AllIterator) Next() (graph.Value, bool) {
 	}
 	if !bytes.HasPrefix(out, it.prefix) {
 		it.Close()
-		return nil, false
+		return false
 	}
-	it.Last = out
-	return out, true
+	it.result = Token(out)
+	return true
 }
 
-func (it *AllIterator) Check(v graph.Value) bool {
-	it.Last = v
+func (it *AllIterator) ResultTree() *graph.ResultTree {
+	return graph.NewResultTree(it.Result())
+}
+
+func (it *AllIterator) Result() graph.Value {
+	return it.result
+}
+
+func (it *AllIterator) NextPath() bool {
+	return false
+}
+
+// No subiterators.
+func (it *AllIterator) SubIterators() []graph.Iterator {
+	return nil
+}
+
+func (it *AllIterator) Contains(v graph.Value) bool {
+	it.result = v
 	return true
 }
 
@@ -105,7 +149,7 @@ func (it *AllIterator) Close() {
 }
 
 func (it *AllIterator) Size() (int64, bool) {
-	size, err := it.ts.SizeOfPrefix(it.prefix)
+	size, err := it.qs.SizeOfPrefix(it.prefix)
 	if err == nil {
 		return size, false
 	}
@@ -113,9 +157,15 @@ func (it *AllIterator) Size() (int64, bool) {
 	return int64(^uint64(0) >> 1), false
 }
 
-func (it *AllIterator) DebugString(indent int) string {
+func (it *AllIterator) Describe() graph.Description {
 	size, _ := it.Size()
-	return fmt.Sprintf("%s(%s tags: %v leveldb size:%d %s %p)", strings.Repeat(" ", indent), it.Type(), it.Tags(), size, it.dir, it)
+	return graph.Description{
+		UID:       it.UID(),
+		Type:      it.Type(),
+		Tags:      it.tags.Tags(),
+		Size:      size,
+		Direction: it.dir,
+	}
 }
 
 func (it *AllIterator) Type() graph.Type { return graph.All }
@@ -128,8 +178,8 @@ func (it *AllIterator) Optimize() (graph.Iterator, bool) {
 func (it *AllIterator) Stats() graph.IteratorStats {
 	s, _ := it.Size()
 	return graph.IteratorStats{
-		CheckCost: 1,
-		NextCost:  2,
-		Size:      s,
+		ContainsCost: 1,
+		NextCost:     2,
+		Size:         s,
 	}
 }

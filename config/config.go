@@ -16,99 +16,127 @@ package config
 
 import (
 	"encoding/json"
-	"flag"
+	"fmt"
 	"os"
-
-	"github.com/barakmich/glog"
+	"strconv"
+	"time"
 )
 
+// Config defines the behavior of cayley database instances.
 type Config struct {
-	DatabaseType    string                 `json:"database"`
-	DatabasePath    string                 `json:"db_path"`
-	DatabaseOptions map[string]interface{} `json:"db_options"`
-	ListenHost      string                 `json:"listen_host"`
-	ListenPort      string                 `json:"listen_port"`
-	ReadOnly        bool                   `json:"read_only"`
-	GremlinTimeout  int                    `json:"gremlin_timeout"`
-	LoadSize        int                    `json:"load_size"`
+	DatabaseType       string
+	DatabasePath       string
+	DatabaseOptions    map[string]interface{}
+	ReplicationType    string
+	ReplicationOptions map[string]interface{}
+	ListenHost         string
+	ListenPort         string
+	ReadOnly           bool
+	Timeout            time.Duration
+	LoadSize           int
 }
 
-var databasePath = flag.String("dbpath", "/tmp/testdb", "Path to the database.")
-var databaseBackend = flag.String("db", "mem", "Database Backend.")
-var host = flag.String("host", "0.0.0.0", "Host to listen on (defaults to all).")
-var loadSize = flag.Int("load_size", 10000, "Size of triplesets to load")
-var port = flag.String("port", "64210", "Port to listen on.")
-var readOnly = flag.Bool("read_only", false, "Disable writing via HTTP.")
-var gremlinTimeout = flag.Int("gremlin_timeout", 30, "Number of seconds until an individual query times out.")
+type config struct {
+	DatabaseType       string                 `json:"database"`
+	DatabasePath       string                 `json:"db_path"`
+	DatabaseOptions    map[string]interface{} `json:"db_options"`
+	ReplicationType    string                 `json:"replication"`
+	ReplicationOptions map[string]interface{} `json:"replication_options"`
+	ListenHost         string                 `json:"listen_host"`
+	ListenPort         string                 `json:"listen_port"`
+	ReadOnly           bool                   `json:"read_only"`
+	Timeout            duration               `json:"timeout"`
+	LoadSize           int                    `json:"load_size"`
+}
 
-func ParseConfigFromFile(filename string) *Config {
-	config := &Config{}
-	if filename == "" {
-		return config
-	}
-	f, err := os.Open(filename)
+func (c *Config) UnmarshalJSON(data []byte) error {
+	var t config
+	err := json.Unmarshal(data, &t)
 	if err != nil {
-		glog.Fatalln("Couldn't open config file", filename)
+		return err
 	}
+	*c = Config{
+		DatabaseType:       t.DatabaseType,
+		DatabasePath:       t.DatabasePath,
+		DatabaseOptions:    t.DatabaseOptions,
+		ReplicationType:    t.ReplicationType,
+		ReplicationOptions: t.ReplicationOptions,
+		ListenHost:         t.ListenHost,
+		ListenPort:         t.ListenPort,
+		ReadOnly:           t.ReadOnly,
+		Timeout:            time.Duration(t.Timeout),
+		LoadSize:           t.LoadSize,
+	}
+	return nil
+}
 
+func (c *Config) MarshalJSON() ([]byte, error) {
+	return json.Marshal(config{
+		DatabaseType:       c.DatabaseType,
+		DatabasePath:       c.DatabasePath,
+		DatabaseOptions:    c.DatabaseOptions,
+		ReplicationType:    c.ReplicationType,
+		ReplicationOptions: c.ReplicationOptions,
+		ListenHost:         c.ListenHost,
+		ListenPort:         c.ListenPort,
+		ReadOnly:           c.ReadOnly,
+		Timeout:            duration(c.Timeout),
+		LoadSize:           c.LoadSize,
+	})
+}
+
+// duration is a time.Duration that satisfies the
+// json.UnMarshaler and json.Marshaler interfaces.
+type duration time.Duration
+
+// UnmarshalJSON unmarshals a duration according to the following scheme:
+//  * If the element is absent the duration is zero.
+//  * If the element is parsable as a time.Duration, the parsed value is kept.
+//  * If the element is parsable as a number, that number of seconds is kept.
+func (d *duration) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		*d = 0
+		return nil
+	}
+	text := string(data)
+	t, err := time.ParseDuration(text)
+	if err == nil {
+		*d = duration(t)
+		return nil
+	}
+	i, err := strconv.ParseInt(text, 10, 64)
+	if err == nil {
+		*d = duration(time.Duration(i) * time.Second)
+		return nil
+	}
+	// This hack is to get around strconv.ParseFloat
+	// not handling e-notation for integers.
+	f, err := strconv.ParseFloat(text, 64)
+	*d = duration(time.Duration(f) * time.Second)
+	return err
+}
+
+func (d *duration) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf("%q", *d)), nil
+}
+
+// Load reads a JSON-encoded config contained in the given file. A zero value
+// config is returned if the filename is empty.
+func Load(file string) (*Config, error) {
+	config := &Config{}
+	if file == "" {
+		return config, nil
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, fmt.Errorf("could not open config file %q: %v", file, err)
+	}
 	defer f.Close()
 
 	dec := json.NewDecoder(f)
 	err = dec.Decode(config)
 	if err != nil {
-		glog.Fatalln("Couldn't read config file:", err)
+		return nil, fmt.Errorf("could not parse config file %q: %v", file, err)
 	}
-	return config
-}
-
-func ParseConfigFromFlagsAndFile(fileFlag string) *Config {
-	// Find the file...
-	var trueFilename string
-	if fileFlag != "" {
-		if _, err := os.Stat(fileFlag); os.IsNotExist(err) {
-			glog.Fatalln("Cannot find specified configuration file", fileFlag, ", aborting.")
-		} else {
-			trueFilename = fileFlag
-		}
-	} else {
-		if _, err := os.Stat(os.Getenv("CAYLEY_CFG")); err == nil {
-			trueFilename = os.Getenv("CAYLEY_CFG")
-		} else {
-			if _, err := os.Stat("/etc/cayley.cfg"); err == nil {
-				trueFilename = "/etc/cayley.cfg"
-			}
-		}
-	}
-	if trueFilename == "" {
-		glog.Infoln("Couldn't find a config file in either $CAYLEY_CFG or /etc/cayley.cfg. Going by flag defaults only.")
-	}
-	config := ParseConfigFromFile(trueFilename)
-
-	if config.DatabasePath == "" {
-		config.DatabasePath = *databasePath
-	}
-
-	if config.DatabaseType == "" {
-		config.DatabaseType = *databaseBackend
-	}
-
-	if config.ListenHost == "" {
-		config.ListenHost = *host
-	}
-
-	if config.ListenPort == "" {
-		config.ListenPort = *port
-	}
-
-	if config.GremlinTimeout == 0 {
-		config.GremlinTimeout = *gremlinTimeout
-	}
-
-	if config.LoadSize == 0 {
-		config.LoadSize = *loadSize
-	}
-
-	config.ReadOnly = config.ReadOnly || *readOnly
-
-	return config
+	return config, nil
 }

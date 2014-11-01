@@ -18,11 +18,11 @@ package iterator
 // contains an explicit fixed array of values.
 //
 // A fixed iterator requires an Equality function to be passed to it, by reason that graph.Value, the
-// opaque Triple store value, may not answer to ==.
+// opaque Quad store value, may not answer to ==.
 
 import (
 	"fmt"
-	"strings"
+	"sort"
 
 	"github.com/google/cayley/graph"
 )
@@ -30,36 +30,33 @@ import (
 // A Fixed iterator consists of it's values, an index (where it is in the process of Next()ing) and
 // an equality function.
 type Fixed struct {
-	Base
+	uid       uint64
+	tags      graph.Tagger
 	values    []graph.Value
 	lastIndex int
 	cmp       Equality
+	result    graph.Value
 }
 
 // Define the signature of an equality function.
 type Equality func(a, b graph.Value) bool
 
 // Define an equality function of purely ==, which works for native types.
-func BasicEquality(a, b graph.Value) bool {
-	if a == b {
-		return true
+func Identity(a, b graph.Value) bool {
+	return a == b
+}
+
+// Creates a new Fixed iterator with a custom comparator.
+func NewFixed(cmp Equality) *Fixed {
+	return &Fixed{
+		uid:    NextUID(),
+		values: make([]graph.Value, 0, 20),
+		cmp:    cmp,
 	}
-	return false
 }
 
-// Creates a new Fixed iterator based around == equality.
-func newFixed() *Fixed {
-	return NewFixedIteratorWithCompare(BasicEquality)
-}
-
-// Creates a new Fixed iterator with a custom comparitor.
-func NewFixedIteratorWithCompare(compareFn Equality) *Fixed {
-	var it Fixed
-	BaseInit(&it.Base)
-	it.values = make([]graph.Value, 0, 20)
-	it.lastIndex = 0
-	it.cmp = compareFn
-	return &it
+func (it *Fixed) UID() uint64 {
+	return it.uid
 }
 
 func (it *Fixed) Reset() {
@@ -68,12 +65,26 @@ func (it *Fixed) Reset() {
 
 func (it *Fixed) Close() {}
 
+func (it *Fixed) Tagger() *graph.Tagger {
+	return &it.tags
+}
+
+func (it *Fixed) TagResults(dst map[string]graph.Value) {
+	for _, tag := range it.tags.Tags() {
+		dst[tag] = it.Result()
+	}
+
+	for tag, value := range it.tags.Fixed() {
+		dst[tag] = value
+	}
+}
+
 func (it *Fixed) Clone() graph.Iterator {
-	out := NewFixedIteratorWithCompare(it.cmp)
+	out := NewFixed(it.cmp)
 	for _, val := range it.values {
 		out.Add(val)
 	}
-	out.CopyTagsFrom(it)
+	out.tags.CopyFrom(it)
 	return out
 }
 
@@ -83,49 +94,71 @@ func (it *Fixed) Add(v graph.Value) {
 	it.values = append(it.values, v)
 }
 
-// Print some information about the iterator.
-func (it *Fixed) DebugString(indent int) string {
-	value := ""
+func (it *Fixed) Describe() graph.Description {
+	var value string
 	if len(it.values) > 0 {
 		value = fmt.Sprint(it.values[0])
 	}
-	return fmt.Sprintf("%s(%s tags: %s Size: %d id0: %d)",
-		strings.Repeat(" ", indent),
-		it.Type(),
-		it.FixedTags(),
-		len(it.values),
-		value,
-	)
+	fixed := make([]string, 0, len(it.tags.Fixed()))
+	for k := range it.tags.Fixed() {
+		fixed = append(fixed, k)
+	}
+	sort.Strings(fixed)
+	return graph.Description{
+		UID:  it.UID(),
+		Name: value,
+		Type: it.Type(),
+		Tags: fixed,
+		Size: int64(len(it.values)),
+	}
 }
 
 // Register this iterator as a Fixed iterator.
 func (it *Fixed) Type() graph.Type { return graph.Fixed }
 
 // Check if the passed value is equal to one of the values stored in the iterator.
-func (it *Fixed) Check(v graph.Value) bool {
+func (it *Fixed) Contains(v graph.Value) bool {
 	// Could be optimized by keeping it sorted or using a better datastructure.
 	// However, for fixed iterators, which are by definition kind of tiny, this
 	// isn't a big issue.
-	graph.CheckLogIn(it, v)
+	graph.ContainsLogIn(it, v)
 	for _, x := range it.values {
 		if it.cmp(x, v) {
-			it.Last = x
-			return graph.CheckLogOut(it, v, true)
+			it.result = x
+			return graph.ContainsLogOut(it, v, true)
 		}
 	}
-	return graph.CheckLogOut(it, v, false)
+	return graph.ContainsLogOut(it, v, false)
 }
 
-// Return the next stored value from the iterator.
-func (it *Fixed) Next() (graph.Value, bool) {
+// Next advances the iterator.
+func (it *Fixed) Next() bool {
 	graph.NextLogIn(it)
 	if it.lastIndex == len(it.values) {
 		return graph.NextLogOut(it, nil, false)
 	}
 	out := it.values[it.lastIndex]
-	it.Last = out
+	it.result = out
 	it.lastIndex++
 	return graph.NextLogOut(it, out, true)
+}
+
+// DEPRECATED
+func (it *Fixed) ResultTree() *graph.ResultTree {
+	return graph.NewResultTree(it.Result())
+}
+
+func (it *Fixed) Result() graph.Value {
+	return it.result
+}
+
+func (it *Fixed) NextPath() bool {
+	return false
+}
+
+// No sub-iterators.
+func (it *Fixed) SubIterators() []graph.Iterator {
+	return nil
 }
 
 // Optimize() for a Fixed iterator is simple. Returns a Null iterator if it's empty
@@ -144,12 +177,12 @@ func (it *Fixed) Size() (int64, bool) {
 	return int64(len(it.values)), true
 }
 
-// As we right now have to scan the entire list, Next and Check are linear with the
+// As we right now have to scan the entire list, Next and Contains are linear with the
 // size. However, a better data structure could remove these limits.
 func (it *Fixed) Stats() graph.IteratorStats {
 	return graph.IteratorStats{
-		CheckCost: int64(len(it.values)),
-		NextCost:  int64(len(it.values)),
-		Size:      int64(len(it.values)),
+		ContainsCost: int64(len(it.values)),
+		NextCost:     int64(len(it.values)),
+		Size:         int64(len(it.values)),
 	}
 }

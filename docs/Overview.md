@@ -1,6 +1,6 @@
 # Overview
 
-## Getting Started 
+## Getting Started
 
 This guide will take you through starting a persistent graph based on the provided data, with some hints for each backend.
 
@@ -17,7 +17,8 @@ You can set up a full [configuration file](/docs/Configuration) if you'd prefer,
 Examples for each backend:
 
   * `leveldb`:  `./cayley init --db=leveldb --dbpath=/tmp/moviedb` -- where /tmp/moviedb is the path you'd like to store your data.
-  * `mongodb`: `./cayley init --db=mongodb --dbpath="<HOSTNAME>:<PORT>"` -- where HOSTNAME and PORT point to your Mongo instance.
+  * `bolt`:  `./cayley init --db=bolt --dbpath=/tmp/moviedb` -- where /tmp/moviedb is the filename where you'd like to store your data.
+  * `mongo`: `./cayley init --db=mongo --dbpath="<HOSTNAME>:<PORT>"` -- where HOSTNAME and PORT point to your Mongo instance.
 
 Those two options (db and dbpath) are always going to be present. If you feel like not repeating yourself, setting up a configuration file for your backend might be something to do now. There's an example file, `cayley.cfg.example` in the root directory.
 
@@ -25,22 +26,16 @@ You can repeat the `--db` and `--dbpath` flags from here forward instead of the 
 
 ### Load Data Into A Graph
 
-Let's extract the sample data, a couple hundred thousand movie triples, that comes in the checkout:
+First we load the data.
 
 ```bash
-zcat 30kmoviedatauniq.n3.gz > 30k.n3
-```
-
-Then, we can load the data.
-
-```bash
-./cayley load --config=cayley.cfg.overview --triples=30k.n3
+./cayley load --config=cayley.cfg.overview --quads=30kmoviedata.nq.gz
 ```
 
 And wait. It will load. If you'd like to watch it load, you can run
 
 ```bash
-./cayley load --config=cayley.cfg.overview --triples=30k.n3 --alsologtostderr
+./cayley load --config=cayley.cfg.overview --quads=30kmoviedata.nq.gz --alsologtostderr
 ```
 
 And watch the log output go by.
@@ -68,7 +63,7 @@ Just as before:
 And you'll see a message not unlike
 
 ```bash
-Cayley now listening on 0.0.0.0:64210
+Cayley now listening on 127.0.0.1:64210
 ```
 
 If you visit that address (often, [http://localhost:64210](http://localhost:64210)) you'll see the full web interface and also have a graph ready to serve queries via the [HTTP API](/docs/HTTP.md)
@@ -87,7 +82,7 @@ Along the side are the various actions or views you can take. From the top, thes
 * Query (a request/response editor for the query language)
 * Query Shape (a visualization of the shape of the final query. Does not execute the query.)
 * Visualize  (runs a query and, if tagged correctly, gives a sigmajs view of the results)
-* Write (an interface to write or remove individual triples or triple files)
+* Write (an interface to write or remove individual quads or quad files)
 
 ----
 

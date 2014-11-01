@@ -20,7 +20,9 @@ import (
 	"testing"
 
 	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/memstore"
+	_ "github.com/google/cayley/graph/memstore"
+	"github.com/google/cayley/quad"
+	_ "github.com/google/cayley/writer"
 )
 
 // This is a simple test graph.
@@ -36,7 +38,7 @@ import (
 //          \-->|#D#|------------->+---+
 //              +---+
 //
-var simpleGraph = []*graph.Triple{
+var simpleGraph = []quad.Quad{
 	{"A", "follows", "B", ""},
 	{"C", "follows", "B", ""},
 	{"C", "follows", "D", ""},
@@ -50,12 +52,13 @@ var simpleGraph = []*graph.Triple{
 	{"G", "status", "cool", "status_graph"},
 }
 
-func makeTestSession(data []*graph.Triple) *Session {
-	ts := memstore.NewTripleStore()
+func makeTestSession(data []quad.Quad) *Session {
+	qs, _ := graph.NewQuadStore("memstore", "", nil)
+	w, _ := graph.NewQuadWriter("single", qs, nil)
 	for _, t := range data {
-		ts.AddTriple(t)
+		w.AddQuad(t)
 	}
-	return NewSession(ts)
+	return NewSession(qs)
 }
 
 var testQueries = []struct {
@@ -164,14 +167,14 @@ var testQueries = []struct {
 	},
 }
 
-func runQuery(g []*graph.Triple, query string) interface{} {
+func runQuery(g []quad.Quad, query string) interface{} {
 	s := makeTestSession(g)
 	c := make(chan interface{}, 5)
 	go s.ExecInput(query, c, -1)
 	for result := range c {
-		s.BuildJson(result)
+		s.BuildJSON(result)
 	}
-	result, _ := s.GetJson()
+	result, _ := s.GetJSON()
 	return result
 }
 
@@ -183,7 +186,7 @@ func TestMQL(t *testing.T) {
 		if !reflect.DeepEqual(got, expect) {
 			b, err := json.MarshalIndent(got, "", " ")
 			if err != nil {
-				t.Fatalf("unexpected JSON marshal error", err)
+				t.Fatalf("unexpected JSON marshal error: %v", err)
 			}
 			t.Errorf("Failed to %s, got: %s expected: %s", test.message, b, test.expect)
 		}

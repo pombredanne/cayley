@@ -23,10 +23,12 @@ import (
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/quad"
+	"github.com/google/cayley/writer"
 )
 
-func makeTripleSet() []*graph.Triple {
-	tripleSet := []*graph.Triple{
+func makeQuadSet() []quad.Quad {
+	quadSet := []quad.Quad{
 		{"A", "follows", "B", ""},
 		{"C", "follows", "B", ""},
 		{"C", "follows", "D", ""},
@@ -39,23 +41,19 @@ func makeTripleSet() []*graph.Triple {
 		{"D", "status", "cool", "status_graph"},
 		{"G", "status", "cool", "status_graph"},
 	}
-	return tripleSet
+	return quadSet
 }
 
-func iteratedTriples(ts graph.TripleStore, it graph.Iterator) []*graph.Triple {
+func iteratedQuads(qs graph.QuadStore, it graph.Iterator) []quad.Quad {
 	var res ordered
-	for {
-		val, ok := it.Next()
-		if !ok {
-			break
-		}
-		res = append(res, ts.Triple(val))
+	for graph.Next(it) {
+		res = append(res, qs.Quad(it.Result()))
 	}
 	sort.Sort(res)
 	return res
 }
 
-type ordered []*graph.Triple
+type ordered []quad.Quad
 
 func (o ordered) Len() int { return len(o) }
 func (o ordered) Less(i, j int) bool {
@@ -72,7 +70,7 @@ func (o ordered) Less(i, j int) bool {
 		o[i].Subject == o[j].Subject &&
 			o[i].Predicate == o[j].Predicate &&
 			o[i].Object == o[j].Object &&
-			o[i].Provenance < o[j].Provenance:
+			o[i].Label < o[j].Label:
 
 		return true
 
@@ -82,14 +80,10 @@ func (o ordered) Less(i, j int) bool {
 }
 func (o ordered) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
 
-func iteratedNames(ts graph.TripleStore, it graph.Iterator) []string {
+func iteratedNames(qs graph.QuadStore, it graph.Iterator) []string {
 	var res []string
-	for {
-		val, ok := it.Next()
-		if !ok {
-			break
-		}
-		res = append(res, ts.NameOf(val))
+	for graph.Next(it) {
+		res = append(res, qs.NameOf(it.Result()))
 	}
 	sort.Strings(res)
 	return res
@@ -102,33 +96,23 @@ func TestCreateDatabase(t *testing.T) {
 	}
 	t.Log(tmpDir)
 
-	if created := CreateNewLevelDB(tmpDir); !created {
+	err = createNewLevelDB(tmpDir, nil)
+	if err != nil {
 		t.Fatal("Failed to create LevelDB database.")
 	}
 
-	ts := NewTripleStore(tmpDir, nil)
-	if ts == nil {
-		t.Error("Failed to create leveldb TripleStore.")
+	qs, err := newQuadStore(tmpDir, nil)
+	if qs == nil || err != nil {
+		t.Error("Failed to create leveldb QuadStore.")
 	}
-	if s := ts.Size(); s != 0 {
+	if s := qs.Size(); s != 0 {
 		t.Errorf("Unexpected size, got:%d expected:0", s)
 	}
-	ts.Close()
+	qs.Close()
 
-	if created := CreateNewLevelDB("/dev/null/some terrible path"); created {
+	err = createNewLevelDB("/dev/null/some terrible path", nil)
+	if err == nil {
 		t.Errorf("Created LevelDB database for bad path.")
-	}
-	// TODO(kortschak) Invalidate this test by using error returns rather than panics.
-	var panicked bool
-	func() {
-		defer func() {
-			r := recover()
-			panicked = r != nil
-		}()
-		NewTripleStore("/dev/null/some terrible path", nil)
-	}()
-	if !panicked {
-		t.Error("NewTripleStore failed to panic with bad path.")
 	}
 
 	os.RemoveAll(tmpDir)
@@ -142,53 +126,70 @@ func TestLoadDatabase(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	t.Log(tmpDir)
 
-	if created := CreateNewLevelDB(tmpDir); !created {
+	err = createNewLevelDB(tmpDir, nil)
+	if err != nil {
 		t.Fatal("Failed to create LevelDB database.")
 	}
 
-	var ts *TripleStore
-
-	ts = NewTripleStore(tmpDir, nil)
-	if ts == nil {
-		t.Error("Failed to create leveldb TripleStore.")
+	qs, err := newQuadStore(tmpDir, nil)
+	if qs == nil || err != nil {
+		t.Error("Failed to create leveldb QuadStore.")
 	}
 
-	ts.AddTriple(&graph.Triple{"Something", "points_to", "Something Else", "context"})
+	w, _ := writer.NewSingleReplication(qs, nil)
+	w.AddQuad(quad.Quad{
+		Subject:   "Something",
+		Predicate: "points_to",
+		Object:    "Something Else",
+		Label:     "context",
+	})
 	for _, pq := range []string{"Something", "points_to", "Something Else", "context"} {
-		if got := ts.NameOf(ts.ValueOf(pq)); got != pq {
+		if got := qs.NameOf(qs.ValueOf(pq)); got != pq {
 			t.Errorf("Failed to roundtrip %q, got:%q expect:%q", pq, got, pq)
 		}
 	}
-	if s := ts.Size(); s != 1 {
-		t.Errorf("Unexpected triplestore size, got:%d expect:1", s)
+	if s := qs.Size(); s != 1 {
+		t.Errorf("Unexpected quadstore size, got:%d expect:1", s)
 	}
-	ts.Close()
+	qs.Close()
 
-	if created := CreateNewLevelDB(tmpDir); !created {
+	err = createNewLevelDB(tmpDir, nil)
+	if err != nil {
 		t.Fatal("Failed to create LevelDB database.")
 	}
-	ts = NewTripleStore(tmpDir, nil)
-	if ts == nil {
-		t.Error("Failed to create leveldb TripleStore.")
+	qs, err = newQuadStore(tmpDir, nil)
+	if qs == nil || err != nil {
+		t.Error("Failed to create leveldb QuadStore.")
+	}
+	w, _ = writer.NewSingleReplication(qs, nil)
+
+	ts2, didConvert := qs.(*QuadStore)
+	if !didConvert {
+		t.Errorf("Could not convert from generic to LevelDB QuadStore")
 	}
 
-	ts.AddTripleSet(makeTripleSet())
-	if s := ts.Size(); s != 11 {
-		t.Errorf("Unexpected triplestore size, got:%d expect:11", s)
+	w.AddQuadSet(makeQuadSet())
+	if s := qs.Size(); s != 11 {
+		t.Errorf("Unexpected quadstore size, got:%d expect:11", s)
 	}
-	if s := ts.SizeOf(ts.ValueOf("B")); s != 5 {
-		t.Errorf("Unexpected triplestore size, got:%d expect:5", s)
-	}
-
-	ts.RemoveTriple(&graph.Triple{"A", "follows", "B", ""})
-	if s := ts.Size(); s != 10 {
-		t.Errorf("Unexpected triplestore size after RemoveTriple, got:%d expect:10", s)
-	}
-	if s := ts.SizeOf(ts.ValueOf("B")); s != 4 {
-		t.Errorf("Unexpected triplestore size, got:%d expect:4", s)
+	if s := ts2.SizeOf(qs.ValueOf("B")); s != 5 {
+		t.Errorf("Unexpected quadstore size, got:%d expect:5", s)
 	}
 
-	ts.Close()
+	w.RemoveQuad(quad.Quad{
+		Subject:   "A",
+		Predicate: "follows",
+		Object:    "B",
+		Label:     "",
+	})
+	if s := qs.Size(); s != 10 {
+		t.Errorf("Unexpected quadstore size after RemoveQuad, got:%d expect:10", s)
+	}
+	if s := ts2.SizeOf(qs.ValueOf("B")); s != 4 {
+		t.Errorf("Unexpected quadstore size, got:%d expect:4", s)
+	}
+
+	qs.Close()
 }
 
 func TestIterator(t *testing.T) {
@@ -199,16 +200,21 @@ func TestIterator(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	t.Log(tmpDir)
 
-	if created := CreateNewLevelDB(tmpDir); !created {
+	err = createNewLevelDB(tmpDir, nil)
+	if err != nil {
 		t.Fatal("Failed to create LevelDB database.")
 	}
 
-	var ts *TripleStore
-	ts = NewTripleStore(tmpDir, nil)
-	ts.AddTripleSet(makeTripleSet())
+	qs, err := newQuadStore(tmpDir, nil)
+	if qs == nil || err != nil {
+		t.Error("Failed to create leveldb QuadStore.")
+	}
+
+	w, _ := writer.NewSingleReplication(qs, nil)
+	w.AddQuadSet(makeQuadSet())
 	var it graph.Iterator
 
-	it = ts.NodesAllIterator()
+	it = qs.NodesAllIterator()
 	if it == nil {
 		t.Fatal("Got nil iterator.")
 	}
@@ -243,7 +249,7 @@ func TestIterator(t *testing.T) {
 	}
 	sort.Strings(expect)
 	for i := 0; i < 2; i++ {
-		got := iteratedNames(ts, it)
+		got := iteratedNames(qs, it)
 		sort.Strings(got)
 		if !reflect.DeepEqual(got, expect) {
 			t.Errorf("Unexpected iterated result on repeat %d, got:%v expect:%v", i, got, expect)
@@ -252,36 +258,36 @@ func TestIterator(t *testing.T) {
 	}
 
 	for _, pq := range expect {
-		if !it.Check(ts.ValueOf(pq)) {
+		if !it.Contains(qs.ValueOf(pq)) {
 			t.Errorf("Failed to find and check %q correctly", pq)
 		}
 	}
 	// FIXME(kortschak) Why does this fail?
 	/*
 		for _, pq := range []string{"baller"} {
-			if it.Check(ts.ValueOf(pq)) {
+			if it.Contains(qs.ValueOf(pq)) {
 				t.Errorf("Failed to check %q correctly", pq)
 			}
 		}
 	*/
 	it.Reset()
 
-	it = ts.TriplesAllIterator()
-	edge, _ := it.Next()
-	triple := ts.Triple(edge)
-	set := makeTripleSet()
+	it = qs.QuadsAllIterator()
+	graph.Next(it)
+	q := qs.Quad(it.Result())
+	set := makeQuadSet()
 	var ok bool
 	for _, t := range set {
-		if t.String() == triple.String() {
+		if t.String() == q.String() {
 			ok = true
 			break
 		}
 	}
 	if !ok {
-		t.Errorf("Failed to find %q during iteration, got:%q", triple, set)
+		t.Errorf("Failed to find %q during iteration, got:%q", q, set)
 	}
 
-	ts.Close()
+	qs.Close()
 }
 
 func TestSetIterator(t *testing.T) {
@@ -289,97 +295,101 @@ func TestSetIterator(t *testing.T) {
 	tmpDir, _ := ioutil.TempDir(os.TempDir(), "cayley_test")
 	t.Log(tmpDir)
 	defer os.RemoveAll(tmpDir)
-	ok := CreateNewLevelDB(tmpDir)
-	if !ok {
+	err := createNewLevelDB(tmpDir, nil)
+	if err != nil {
 		t.Fatalf("Failed to create working directory")
 	}
 
-	ts := NewTripleStore(tmpDir, nil)
-	defer ts.Close()
+	qs, err := newQuadStore(tmpDir, nil)
+	if qs == nil || err != nil {
+		t.Error("Failed to create leveldb QuadStore.")
+	}
+	defer qs.Close()
 
-	ts.AddTripleSet(makeTripleSet())
+	w, _ := writer.NewSingleReplication(qs, nil)
+	w.AddQuadSet(makeQuadSet())
 
-	expect := []*graph.Triple{
+	expect := []quad.Quad{
 		{"C", "follows", "B", ""},
 		{"C", "follows", "D", ""},
 	}
 	sort.Sort(ordered(expect))
 
 	// Subject iterator.
-	it := ts.TripleIterator(graph.Subject, ts.ValueOf("C"))
+	it := qs.QuadIterator(quad.Subject, qs.ValueOf("C"))
 
-	if got := iteratedTriples(ts, it); !reflect.DeepEqual(got, expect) {
+	if got := iteratedQuads(qs, it); !reflect.DeepEqual(got, expect) {
 		t.Errorf("Failed to get expected results, got:%v expect:%v", got, expect)
 	}
 	it.Reset()
 
 	and := iterator.NewAnd()
-	and.AddSubIterator(ts.TriplesAllIterator())
+	and.AddSubIterator(qs.QuadsAllIterator())
 	and.AddSubIterator(it)
 
-	if got := iteratedTriples(ts, and); !reflect.DeepEqual(got, expect) {
+	if got := iteratedQuads(qs, and); !reflect.DeepEqual(got, expect) {
 		t.Errorf("Failed to get confirm expected results, got:%v expect:%v", got, expect)
 	}
 
 	// Object iterator.
-	it = ts.TripleIterator(graph.Object, ts.ValueOf("F"))
+	it = qs.QuadIterator(quad.Object, qs.ValueOf("F"))
 
-	expect = []*graph.Triple{
+	expect = []quad.Quad{
 		{"B", "follows", "F", ""},
 		{"E", "follows", "F", ""},
 	}
 	sort.Sort(ordered(expect))
-	if got := iteratedTriples(ts, it); !reflect.DeepEqual(got, expect) {
+	if got := iteratedQuads(qs, it); !reflect.DeepEqual(got, expect) {
 		t.Errorf("Failed to get expected results, got:%v expect:%v", got, expect)
 	}
 
 	and = iterator.NewAnd()
-	and.AddSubIterator(ts.TripleIterator(graph.Subject, ts.ValueOf("B")))
+	and.AddSubIterator(qs.QuadIterator(quad.Subject, qs.ValueOf("B")))
 	and.AddSubIterator(it)
 
-	expect = []*graph.Triple{
+	expect = []quad.Quad{
 		{"B", "follows", "F", ""},
 	}
-	if got := iteratedTriples(ts, and); !reflect.DeepEqual(got, expect) {
+	if got := iteratedQuads(qs, and); !reflect.DeepEqual(got, expect) {
 		t.Errorf("Failed to get confirm expected results, got:%v expect:%v", got, expect)
 	}
 
 	// Predicate iterator.
-	it = ts.TripleIterator(graph.Predicate, ts.ValueOf("status"))
+	it = qs.QuadIterator(quad.Predicate, qs.ValueOf("status"))
 
-	expect = []*graph.Triple{
+	expect = []quad.Quad{
 		{"B", "status", "cool", "status_graph"},
 		{"D", "status", "cool", "status_graph"},
 		{"G", "status", "cool", "status_graph"},
 	}
 	sort.Sort(ordered(expect))
-	if got := iteratedTriples(ts, it); !reflect.DeepEqual(got, expect) {
+	if got := iteratedQuads(qs, it); !reflect.DeepEqual(got, expect) {
 		t.Errorf("Failed to get expected results from predicate iterator, got:%v expect:%v", got, expect)
 	}
 
-	// Provenance iterator.
-	it = ts.TripleIterator(graph.Provenance, ts.ValueOf("status_graph"))
+	// Label iterator.
+	it = qs.QuadIterator(quad.Label, qs.ValueOf("status_graph"))
 
-	expect = []*graph.Triple{
+	expect = []quad.Quad{
 		{"B", "status", "cool", "status_graph"},
 		{"D", "status", "cool", "status_graph"},
 		{"G", "status", "cool", "status_graph"},
 	}
 	sort.Sort(ordered(expect))
-	if got := iteratedTriples(ts, it); !reflect.DeepEqual(got, expect) {
+	if got := iteratedQuads(qs, it); !reflect.DeepEqual(got, expect) {
 		t.Errorf("Failed to get expected results from predicate iterator, got:%v expect:%v", got, expect)
 	}
 	it.Reset()
 
 	// Order is important
 	and = iterator.NewAnd()
-	and.AddSubIterator(ts.TripleIterator(graph.Subject, ts.ValueOf("B")))
+	and.AddSubIterator(qs.QuadIterator(quad.Subject, qs.ValueOf("B")))
 	and.AddSubIterator(it)
 
-	expect = []*graph.Triple{
+	expect = []quad.Quad{
 		{"B", "status", "cool", "status_graph"},
 	}
-	if got := iteratedTriples(ts, and); !reflect.DeepEqual(got, expect) {
+	if got := iteratedQuads(qs, and); !reflect.DeepEqual(got, expect) {
 		t.Errorf("Failed to get confirm expected results, got:%v expect:%v", got, expect)
 	}
 	it.Reset()
@@ -387,12 +397,12 @@ func TestSetIterator(t *testing.T) {
 	// Order is important
 	and = iterator.NewAnd()
 	and.AddSubIterator(it)
-	and.AddSubIterator(ts.TripleIterator(graph.Subject, ts.ValueOf("B")))
+	and.AddSubIterator(qs.QuadIterator(quad.Subject, qs.ValueOf("B")))
 
-	expect = []*graph.Triple{
+	expect = []quad.Quad{
 		{"B", "status", "cool", "status_graph"},
 	}
-	if got := iteratedTriples(ts, and); !reflect.DeepEqual(got, expect) {
+	if got := iteratedQuads(qs, and); !reflect.DeepEqual(got, expect) {
 		t.Errorf("Failed to get confirm expected results, got:%v expect:%v", got, expect)
 	}
 }
@@ -401,18 +411,23 @@ func TestOptimize(t *testing.T) {
 	tmpDir, _ := ioutil.TempDir(os.TempDir(), "cayley_test")
 	t.Log(tmpDir)
 	defer os.RemoveAll(tmpDir)
-	ok := CreateNewLevelDB(tmpDir)
-	if !ok {
+	err := createNewLevelDB(tmpDir, nil)
+	if err != nil {
 		t.Fatalf("Failed to create working directory")
 	}
-	ts := NewTripleStore(tmpDir, nil)
-	ts.AddTripleSet(makeTripleSet())
+	qs, err := newQuadStore(tmpDir, nil)
+	if qs == nil || err != nil {
+		t.Error("Failed to create leveldb QuadStore.")
+	}
+
+	w, _ := writer.NewSingleReplication(qs, nil)
+	w.AddQuadSet(makeQuadSet())
 
 	// With an linksto-fixed pair
-	fixed := ts.FixedIterator()
-	fixed.Add(ts.ValueOf("F"))
-	fixed.AddTag("internal")
-	lto := iterator.NewLinksTo(ts, fixed, graph.Object)
+	fixed := qs.FixedIterator()
+	fixed.Add(qs.ValueOf("F"))
+	fixed.Tagger().Add("internal")
+	lto := iterator.NewLinksTo(qs, fixed, quad.Object)
 
 	oldIt := lto.Clone()
 	newIt, ok := lto.Optimize()
@@ -423,16 +438,16 @@ func TestOptimize(t *testing.T) {
 		t.Errorf("Optimized iterator type does not match original, got:%v expect:%v", newIt.Type(), Type())
 	}
 
-	newTriples := iteratedTriples(ts, newIt)
-	oldTriples := iteratedTriples(ts, oldIt)
-	if !reflect.DeepEqual(newTriples, oldTriples) {
+	newQuads := iteratedQuads(qs, newIt)
+	oldQuads := iteratedQuads(qs, oldIt)
+	if !reflect.DeepEqual(newQuads, oldQuads) {
 		t.Errorf("Optimized iteration does not match original")
 	}
 
-	oldIt.Next()
+	graph.Next(oldIt)
 	oldResults := make(map[string]graph.Value)
 	oldIt.TagResults(oldResults)
-	newIt.Next()
+	graph.Next(newIt)
 	newResults := make(map[string]graph.Value)
 	newIt.TagResults(newResults)
 	if !reflect.DeepEqual(newResults, oldResults) {

@@ -16,20 +16,21 @@ package mongo
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/barakmich/glog"
-	"labix.org/v2/mgo"
-	"labix.org/v2/mgo/bson"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/quad"
 )
 
 type Iterator struct {
-	iterator.Base
-	ts         *TripleStore
-	dir        graph.Direction
+	uid        uint64
+	tags       graph.Tagger
+	qs         *QuadStore
+	dir        quad.Direction
 	iter       *mgo.Iter
 	hash       string
 	name       string
@@ -37,60 +38,63 @@ type Iterator struct {
 	isAll      bool
 	constraint bson.M
 	collection string
+	result     graph.Value
 }
 
-func NewIterator(ts *TripleStore, collection string, d graph.Direction, val graph.Value) *Iterator {
-	var m Iterator
-	iterator.BaseInit(&m.Base)
+func NewIterator(qs *QuadStore, collection string, d quad.Direction, val graph.Value) *Iterator {
+	name := qs.NameOf(val)
 
-	m.name = ts.NameOf(val)
-	m.collection = collection
-	switch d {
-	case graph.Subject:
-		m.constraint = bson.M{"Subject": m.name}
-	case graph.Predicate:
-		m.constraint = bson.M{"Predicate": m.name}
-	case graph.Object:
-		m.constraint = bson.M{"Object": m.name}
-	case graph.Provenance:
-		m.constraint = bson.M{"Provenance": m.name}
-	}
+	constraint := bson.M{d.String(): name}
 
-	m.ts = ts
-	m.dir = d
-	m.iter = ts.db.C(collection).Find(m.constraint).Iter()
-	size, err := ts.db.C(collection).Find(m.constraint).Count()
+	size, err := qs.db.C(collection).Find(constraint).Count()
 	if err != nil {
+		// FIXME(kortschak) This should be passed back rather than just logging.
 		glog.Errorln("Trouble getting size for iterator! ", err)
 		return nil
 	}
-	m.size = int64(size)
-	m.hash = val.(string)
-	m.isAll = false
-	return &m
+
+	return &Iterator{
+		uid:        iterator.NextUID(),
+		name:       name,
+		constraint: constraint,
+		collection: collection,
+		qs:         qs,
+		dir:        d,
+		iter:       qs.db.C(collection).Find(constraint).Iter(),
+		size:       int64(size),
+		hash:       val.(string),
+		isAll:      false,
+	}
 }
 
-func NewAllIterator(ts *TripleStore, collection string) *Iterator {
-	var m Iterator
-	m.ts = ts
-	m.dir = graph.Any
-	m.constraint = nil
-	m.collection = collection
-	m.iter = ts.db.C(collection).Find(nil).Iter()
-	size, err := ts.db.C(collection).Count()
+func NewAllIterator(qs *QuadStore, collection string) *Iterator {
+	size, err := qs.db.C(collection).Count()
 	if err != nil {
+		// FIXME(kortschak) This should be passed back rather than just logging.
 		glog.Errorln("Trouble getting size for iterator! ", err)
 		return nil
 	}
-	m.size = int64(size)
-	m.hash = ""
-	m.isAll = true
-	return &m
+
+	return &Iterator{
+		uid:        iterator.NextUID(),
+		qs:         qs,
+		dir:        quad.Any,
+		constraint: nil,
+		collection: collection,
+		iter:       qs.db.C(collection).Find(nil).Iter(),
+		size:       int64(size),
+		hash:       "",
+		isAll:      true,
+	}
+}
+
+func (it *Iterator) UID() uint64 {
+	return it.uid
 }
 
 func (it *Iterator) Reset() {
 	it.iter.Close()
-	it.iter = it.ts.db.C(it.collection).Find(it.constraint).Iter()
+	it.iter = it.qs.db.C(it.collection).Find(it.constraint).Iter()
 
 }
 
@@ -98,23 +102,36 @@ func (it *Iterator) Close() {
 	it.iter.Close()
 }
 
-func (it *Iterator) Clone() graph.Iterator {
-	var newM graph.Iterator
-	if it.isAll {
-		newM = NewAllIterator(it.ts, it.collection)
-	} else {
-		newM = NewIterator(it.ts, it.collection, it.dir, it.hash)
-	}
-	newM.CopyTagsFrom(it)
-	return newM
+func (it *Iterator) Tagger() *graph.Tagger {
+	return &it.tags
 }
 
-func (it *Iterator) Next() (graph.Value, bool) {
+func (it *Iterator) TagResults(dst map[string]graph.Value) {
+	for _, tag := range it.tags.Tags() {
+		dst[tag] = it.Result()
+	}
+
+	for tag, value := range it.tags.Fixed() {
+		dst[tag] = value
+	}
+}
+
+func (it *Iterator) Clone() graph.Iterator {
+	var m *Iterator
+	if it.isAll {
+		m = NewAllIterator(it.qs, it.collection)
+	} else {
+		m = NewIterator(it.qs, it.collection, it.dir, it.hash)
+	}
+	m.tags.CopyFrom(it)
+	return m
+}
+
+func (it *Iterator) Next() bool {
 	var result struct {
-		Id string "_id"
-		//Sub string "Sub"
-		//Pred string "Pred"
-		//Obj string "Obj"
+		ID      string  `bson:"_id"`
+		Added   []int64 `bson:"Added"`
+		Deleted []int64 `bson:"Deleted"`
 	}
 	found := it.iter.Next(&result)
 	if !found {
@@ -122,35 +139,55 @@ func (it *Iterator) Next() (graph.Value, bool) {
 		if err != nil {
 			glog.Errorln("Error Nexting Iterator: ", err)
 		}
-		return nil, false
+		return false
 	}
-	it.Last = result.Id
-	return result.Id, true
+	if it.collection == "quads" && len(result.Added) <= len(result.Deleted) {
+		return it.Next()
+	}
+	it.result = result.ID
+	return true
 }
 
-func (it *Iterator) Check(v graph.Value) bool {
-	graph.CheckLogIn(it, v)
+func (it *Iterator) ResultTree() *graph.ResultTree {
+	return graph.NewResultTree(it.Result())
+}
+
+func (it *Iterator) Result() graph.Value {
+	return it.result
+}
+
+func (it *Iterator) NextPath() bool {
+	return false
+}
+
+// No subiterators.
+func (it *Iterator) SubIterators() []graph.Iterator {
+	return nil
+}
+
+func (it *Iterator) Contains(v graph.Value) bool {
+	graph.ContainsLogIn(it, v)
 	if it.isAll {
-		it.Last = v
-		return graph.CheckLogOut(it, v, true)
+		it.result = v
+		return graph.ContainsLogOut(it, v, true)
 	}
 	var offset int
 	switch it.dir {
-	case graph.Subject:
+	case quad.Subject:
 		offset = 0
-	case graph.Predicate:
-		offset = (it.ts.hasher.Size() * 2)
-	case graph.Object:
-		offset = (it.ts.hasher.Size() * 2) * 2
-	case graph.Provenance:
-		offset = (it.ts.hasher.Size() * 2) * 3
+	case quad.Predicate:
+		offset = (hashSize * 2)
+	case quad.Object:
+		offset = (hashSize * 2) * 2
+	case quad.Label:
+		offset = (hashSize * 2) * 3
 	}
-	val := v.(string)[offset : it.ts.hasher.Size()*2+offset]
+	val := v.(string)[offset : hashSize*2+offset]
 	if val == it.hash {
-		it.Last = v
-		return graph.CheckLogOut(it, v, true)
+		it.result = v
+		return graph.ContainsLogOut(it, v, true)
 	}
-	return graph.CheckLogOut(it, v, false)
+	return graph.ContainsLogOut(it, v, false)
 }
 
 func (it *Iterator) Size() (int64, bool) {
@@ -160,7 +197,7 @@ func (it *Iterator) Size() (int64, bool) {
 var mongoType graph.Type
 
 func init() {
-	mongoType = graph.Register("mongo")
+	mongoType = graph.RegisterIterator("mongo")
 }
 
 func Type() graph.Type { return mongoType }
@@ -175,16 +212,21 @@ func (it *Iterator) Type() graph.Type {
 func (it *Iterator) Sorted() bool                     { return true }
 func (it *Iterator) Optimize() (graph.Iterator, bool) { return it, false }
 
-func (it *Iterator) DebugString(indent int) string {
+func (it *Iterator) Describe() graph.Description {
 	size, _ := it.Size()
-	return fmt.Sprintf("%s(%s size:%d %s %s)", strings.Repeat(" ", indent), it.Type(), size, it.hash, it.name)
+	return graph.Description{
+		UID:  it.UID(),
+		Name: fmt.Sprintf("%s/%s", it.name, it.hash),
+		Type: it.Type(),
+		Size: size,
+	}
 }
 
 func (it *Iterator) Stats() graph.IteratorStats {
 	size, _ := it.Size()
 	return graph.IteratorStats{
-		CheckCost: 1,
-		NextCost:  5,
-		Size:      size,
+		ContainsCost: 1,
+		NextCost:     5,
+		Size:         size,
 	}
 }

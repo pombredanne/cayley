@@ -20,7 +20,10 @@ import (
 	"testing"
 
 	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/memstore"
+	"github.com/google/cayley/quad"
+
+	_ "github.com/google/cayley/graph/memstore"
+	_ "github.com/google/cayley/writer"
 )
 
 // This is a simple test graph.
@@ -36,7 +39,7 @@ import (
 //          \-->|#D#|------------->+---+
 //              +---+
 //
-var simpleGraph = []*graph.Triple{
+var simpleGraph = []quad.Quad{
 	{"A", "follows", "B", ""},
 	{"C", "follows", "B", ""},
 	{"C", "follows", "D", ""},
@@ -50,12 +53,13 @@ var simpleGraph = []*graph.Triple{
 	{"G", "status", "cool", "status_graph"},
 }
 
-func makeTestSession(data []*graph.Triple) *Session {
-	ts := memstore.NewTripleStore()
+func makeTestSession(data []quad.Quad) *Session {
+	qs, _ := graph.NewQuadStore("memstore", "", nil)
+	w, _ := graph.NewQuadWriter("single", qs, nil)
 	for _, t := range data {
-		ts.AddTriple(t)
+		w.AddQuad(t)
 	}
-	return NewSession(ts, -1, false)
+	return NewSession(qs, -1, false)
 }
 
 var testQueries = []struct {
@@ -244,18 +248,18 @@ var testQueries = []struct {
 	},
 }
 
-func runQueryGetTag(g []*graph.Triple, query string, tag string) []string {
+func runQueryGetTag(g []quad.Quad, query string, tag string) []string {
 	js := makeTestSession(g)
 	c := make(chan interface{}, 5)
 	js.ExecInput(query, c, -1)
 
 	var results []string
 	for res := range c {
-		data := res.(*GremlinResult)
+		data := res.(*Result)
 		if data.val == nil {
-			val := (*data.actualResults)[tag]
+			val := data.actualResults[tag]
 			if val != nil {
-				results = append(results, js.ts.NameOf(val))
+				results = append(results, js.qs.NameOf(val))
 			}
 		}
 	}
@@ -274,5 +278,46 @@ func TestGremlin(t *testing.T) {
 		if !reflect.DeepEqual(got, test.expect) {
 			t.Errorf("Failed to %s, got: %v expected: %v", test.message, got, test.expect)
 		}
+	}
+}
+
+var issue160TestGraph = []quad.Quad{
+	{"alice", "follows", "bob", ""},
+	{"bob", "follows", "alice", ""},
+	{"charlie", "follows", "bob", ""},
+	{"dani", "follows", "charlie", ""},
+	{"dani", "follows", "alice", ""},
+	{"alice", "is", "cool", ""},
+	{"bob", "is", "not cool", ""},
+	{"charlie", "is", "cool", ""},
+	{"danie", "is", "not cool", ""},
+}
+
+func TestIssue160(t *testing.T) {
+	query := `g.V().Tag('query').Out('follows').Out('follows').ForEach(function (item) { if (item.id !== item.query) g.Emit({ id: item.id }); })`
+	expect := []string{
+		"****\nid : alice\n",
+		"****\nid : bob\n",
+		"****\nid : bob\n",
+		"=> <nil>\n",
+	}
+
+	ses := makeTestSession(issue160TestGraph)
+	c := make(chan interface{}, 5)
+	go ses.ExecInput(query, c, 100)
+	var got []string
+	for res := range c {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("Unexpected panic: %v", r)
+				}
+			}()
+			got = append(got, ses.ToText(res))
+		}()
+	}
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, expect) {
+		t.Errorf("Unexpected result, got: %q expected: %q", got, expect)
 	}
 }

@@ -15,6 +15,8 @@
 package gremlin
 
 import (
+	"encoding/json"
+
 	"github.com/barakmich/glog"
 	"github.com/robertkrimen/otto"
 
@@ -24,46 +26,46 @@ import (
 
 const TopResultTag = "id"
 
-func embedFinals(env *otto.Otto, ses *Session, obj *otto.Object) {
-	obj.Set("All", allFunc(env, ses, obj))
-	obj.Set("GetLimit", limitFunc(env, ses, obj))
-	obj.Set("ToArray", toArrayFunc(env, ses, obj, false))
-	obj.Set("ToValue", toValueFunc(env, ses, obj, false))
-	obj.Set("TagArray", toArrayFunc(env, ses, obj, true))
-	obj.Set("TagValue", toValueFunc(env, ses, obj, true))
-	obj.Set("Map", mapFunc(env, ses, obj))
-	obj.Set("ForEach", mapFunc(env, ses, obj))
+func (wk *worker) embedFinals(env *otto.Otto, obj *otto.Object) {
+	obj.Set("All", wk.allFunc(env, obj))
+	obj.Set("GetLimit", wk.limitFunc(env, obj))
+	obj.Set("ToArray", wk.toArrayFunc(env, obj, false))
+	obj.Set("ToValue", wk.toValueFunc(env, obj, false))
+	obj.Set("TagArray", wk.toArrayFunc(env, obj, true))
+	obj.Set("TagValue", wk.toValueFunc(env, obj, true))
+	obj.Set("Map", wk.mapFunc(env, obj))
+	obj.Set("ForEach", wk.mapFunc(env, obj))
 }
 
-func allFunc(env *otto.Otto, ses *Session, obj *otto.Object) func(otto.FunctionCall) otto.Value {
+func (wk *worker) allFunc(env *otto.Otto, obj *otto.Object) func(otto.FunctionCall) otto.Value {
 	return func(call otto.FunctionCall) otto.Value {
-		it := buildIteratorTree(obj, ses.ts)
-		it.AddTag(TopResultTag)
-		ses.limit = -1
-		ses.count = 0
-		runIteratorOnSession(it, ses)
+		it := buildIteratorTree(obj, wk.qs)
+		it.Tagger().Add(TopResultTag)
+		wk.limit = -1
+		wk.count = 0
+		wk.runIterator(it)
 		return otto.NullValue()
 	}
 }
 
-func limitFunc(env *otto.Otto, ses *Session, obj *otto.Object) func(otto.FunctionCall) otto.Value {
+func (wk *worker) limitFunc(env *otto.Otto, obj *otto.Object) func(otto.FunctionCall) otto.Value {
 	return func(call otto.FunctionCall) otto.Value {
 		if len(call.ArgumentList) > 0 {
 			limitVal, _ := call.Argument(0).ToInteger()
-			it := buildIteratorTree(obj, ses.ts)
-			it.AddTag(TopResultTag)
-			ses.limit = int(limitVal)
-			ses.count = 0
-			runIteratorOnSession(it, ses)
+			it := buildIteratorTree(obj, wk.qs)
+			it.Tagger().Add(TopResultTag)
+			wk.limit = int(limitVal)
+			wk.count = 0
+			wk.runIterator(it)
 		}
 		return otto.NullValue()
 	}
 }
 
-func toArrayFunc(env *otto.Otto, ses *Session, obj *otto.Object, withTags bool) func(otto.FunctionCall) otto.Value {
+func (wk *worker) toArrayFunc(env *otto.Otto, obj *otto.Object, withTags bool) func(otto.FunctionCall) otto.Value {
 	return func(call otto.FunctionCall) otto.Value {
-		it := buildIteratorTree(obj, ses.ts)
-		it.AddTag(TopResultTag)
+		it := buildIteratorTree(obj, wk.qs)
+		it.Tagger().Add(TopResultTag)
 		limit := -1
 		if len(call.ArgumentList) > 0 {
 			limitParsed, _ := call.Argument(0).ToInteger()
@@ -72,10 +74,10 @@ func toArrayFunc(env *otto.Otto, ses *Session, obj *otto.Object, withTags bool) 
 		var val otto.Value
 		var err error
 		if !withTags {
-			array := runIteratorToArrayNoTags(it, ses, limit)
+			array := wk.runIteratorToArrayNoTags(it, limit)
 			val, err = call.Otto.ToValue(array)
 		} else {
-			array := runIteratorToArray(it, ses, limit)
+			array := wk.runIteratorToArray(it, limit)
 			val, err = call.Otto.ToValue(array)
 		}
 
@@ -87,21 +89,21 @@ func toArrayFunc(env *otto.Otto, ses *Session, obj *otto.Object, withTags bool) 
 	}
 }
 
-func toValueFunc(env *otto.Otto, ses *Session, obj *otto.Object, withTags bool) func(otto.FunctionCall) otto.Value {
+func (wk *worker) toValueFunc(env *otto.Otto, obj *otto.Object, withTags bool) func(otto.FunctionCall) otto.Value {
 	return func(call otto.FunctionCall) otto.Value {
-		it := buildIteratorTree(obj, ses.ts)
-		it.AddTag(TopResultTag)
+		it := buildIteratorTree(obj, wk.qs)
+		it.Tagger().Add(TopResultTag)
 		limit := 1
 		var val otto.Value
 		var err error
 		if !withTags {
-			array := runIteratorToArrayNoTags(it, ses, limit)
+			array := wk.runIteratorToArrayNoTags(it, limit)
 			if len(array) < 1 {
 				return otto.NullValue()
 			}
 			val, err = call.Otto.ToValue(array[0])
 		} else {
-			array := runIteratorToArray(it, ses, limit)
+			array := wk.runIteratorToArray(it, limit)
 			if len(array) < 1 {
 				return otto.NullValue()
 			}
@@ -110,17 +112,15 @@ func toValueFunc(env *otto.Otto, ses *Session, obj *otto.Object, withTags bool) 
 		if err != nil {
 			glog.Error(err)
 			return otto.NullValue()
-		} else {
-			return val
 		}
-
+		return val
 	}
 }
 
-func mapFunc(env *otto.Otto, ses *Session, obj *otto.Object) func(otto.FunctionCall) otto.Value {
+func (wk *worker) mapFunc(env *otto.Otto, obj *otto.Object) func(otto.FunctionCall) otto.Value {
 	return func(call otto.FunctionCall) otto.Value {
-		it := buildIteratorTree(obj, ses.ts)
-		it.AddTag(TopResultTag)
+		it := buildIteratorTree(obj, wk.qs)
+		it.Tagger().Add(TopResultTag)
 		limit := -1
 		if len(call.ArgumentList) == 0 {
 			return otto.NullValue()
@@ -130,47 +130,50 @@ func mapFunc(env *otto.Otto, ses *Session, obj *otto.Object) func(otto.FunctionC
 			limitParsed, _ := call.Argument(0).ToInteger()
 			limit = int(limitParsed)
 		}
-		runIteratorWithCallback(it, ses, callback, call, limit)
+		wk.runIteratorWithCallback(it, callback, call, limit)
 		return otto.NullValue()
 	}
 }
 
-func tagsToValueMap(m map[string]graph.Value, ses *Session) map[string]string {
+func (wk *worker) tagsToValueMap(m map[string]graph.Value) map[string]string {
 	outputMap := make(map[string]string)
 	for k, v := range m {
-		outputMap[k] = ses.ts.NameOf(v)
+		outputMap[k] = wk.qs.NameOf(v)
 	}
 	return outputMap
 }
 
-func runIteratorToArray(it graph.Iterator, ses *Session, limit int) []map[string]string {
+func (wk *worker) runIteratorToArray(it graph.Iterator, limit int) []map[string]string {
 	output := make([]map[string]string, 0)
-	count := 0
+	n := 0
 	it, _ = it.Optimize()
 	for {
-		if ses.doHalt {
+		select {
+		case <-wk.kill:
 			return nil
+		default:
 		}
-		_, ok := it.Next()
-		if !ok {
+		if !graph.Next(it) {
 			break
 		}
 		tags := make(map[string]graph.Value)
 		it.TagResults(tags)
-		output = append(output, tagsToValueMap(tags, ses))
-		count++
-		if limit >= 0 && count >= limit {
+		output = append(output, wk.tagsToValueMap(tags))
+		n++
+		if limit >= 0 && n >= limit {
 			break
 		}
-		for it.NextResult() == true {
-			if ses.doHalt {
+		for it.NextPath() {
+			select {
+			case <-wk.kill:
 				return nil
+			default:
 			}
 			tags := make(map[string]graph.Value)
 			it.TagResults(tags)
-			output = append(output, tagsToValueMap(tags, ses))
-			count++
-			if limit >= 0 && count >= limit {
+			output = append(output, wk.tagsToValueMap(tags))
+			n++
+			if limit >= 0 && n >= limit {
 				break
 			}
 		}
@@ -179,21 +182,22 @@ func runIteratorToArray(it graph.Iterator, ses *Session, limit int) []map[string
 	return output
 }
 
-func runIteratorToArrayNoTags(it graph.Iterator, ses *Session, limit int) []string {
+func (wk *worker) runIteratorToArrayNoTags(it graph.Iterator, limit int) []string {
 	output := make([]string, 0)
-	count := 0
+	n := 0
 	it, _ = it.Optimize()
 	for {
-		if ses.doHalt {
+		select {
+		case <-wk.kill:
 			return nil
+		default:
 		}
-		val, ok := it.Next()
-		if !ok {
+		if !graph.Next(it) {
 			break
 		}
-		output = append(output, ses.ts.NameOf(val))
-		count++
-		if limit >= 0 && count >= limit {
+		output = append(output, wk.qs.NameOf(it.Result()))
+		n++
+		if limit >= 0 && n >= limit {
 			break
 		}
 	}
@@ -201,35 +205,46 @@ func runIteratorToArrayNoTags(it graph.Iterator, ses *Session, limit int) []stri
 	return output
 }
 
-func runIteratorWithCallback(it graph.Iterator, ses *Session, callback otto.Value, this otto.FunctionCall, limit int) {
-	count := 0
+func (wk *worker) runIteratorWithCallback(it graph.Iterator, callback otto.Value, this otto.FunctionCall, limit int) {
+	n := 0
 	it, _ = it.Optimize()
-	for {
-		if ses.doHalt {
-			return
+	if glog.V(2) {
+		b, err := json.MarshalIndent(it.Describe(), "", "  ")
+		if err != nil {
+			glog.V(2).Infof("failed to format description: %v", err)
+		} else {
+			glog.V(2).Infof("%s", b)
 		}
-		_, ok := it.Next()
-		if !ok {
+	}
+	for {
+		select {
+		case <-wk.kill:
+			return
+		default:
+		}
+		if !graph.Next(it) {
 			break
 		}
 		tags := make(map[string]graph.Value)
 		it.TagResults(tags)
-		val, _ := this.Otto.ToValue(tagsToValueMap(tags, ses))
+		val, _ := this.Otto.ToValue(wk.tagsToValueMap(tags))
 		val, _ = callback.Call(this.This, val)
-		count++
-		if limit >= 0 && count >= limit {
+		n++
+		if limit >= 0 && n >= limit {
 			break
 		}
-		for it.NextResult() == true {
-			if ses.doHalt {
+		for it.NextPath() {
+			select {
+			case <-wk.kill:
 				return
+			default:
 			}
 			tags := make(map[string]graph.Value)
 			it.TagResults(tags)
-			val, _ := this.Otto.ToValue(tagsToValueMap(tags, ses))
+			val, _ := this.Otto.ToValue(wk.tagsToValueMap(tags))
 			val, _ = callback.Call(this.This, val)
-			count++
-			if limit >= 0 && count >= limit {
+			n++
+			if limit >= 0 && n >= limit {
 				break
 			}
 		}
@@ -237,39 +252,70 @@ func runIteratorWithCallback(it graph.Iterator, ses *Session, callback otto.Valu
 	it.Close()
 }
 
-func runIteratorOnSession(it graph.Iterator, ses *Session) {
-	if ses.lookingForQueryShape {
-		iterator.OutputQueryShapeForIterator(it, ses.ts, ses.queryShape)
+func (wk *worker) send(r *Result) bool {
+	if wk.limit >= 0 && wk.limit == wk.count {
+		return false
+	}
+	select {
+	case <-wk.kill:
+		return false
+	default:
+	}
+	if wk.results != nil {
+		wk.results <- r
+		wk.count++
+		if wk.limit >= 0 && wk.limit == wk.count {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func (wk *worker) runIterator(it graph.Iterator) {
+	if wk.wantShape() {
+		iterator.OutputQueryShapeForIterator(it, wk.qs, wk.shape)
 		return
 	}
 	it, _ = it.Optimize()
-	glog.V(2).Infoln(it.DebugString(0))
-	for {
-		// TODO(barakmich): Better halting.
-		if ses.doHalt {
-			return
+	if glog.V(2) {
+		b, err := json.MarshalIndent(it.Describe(), "", "  ")
+		if err != nil {
+			glog.Infof("failed to format description: %v", err)
+		} else {
+			glog.Infof("%s", b)
 		}
-		_, ok := it.Next()
-		if !ok {
+	}
+	for {
+		select {
+		case <-wk.kill:
+			return
+		default:
+		}
+		if !graph.Next(it) {
 			break
 		}
 		tags := make(map[string]graph.Value)
 		it.TagResults(tags)
-		cont := ses.SendResult(&GremlinResult{metaresult: false, err: "", val: nil, actualResults: &tags})
-		if !cont {
+		if !wk.send(&Result{actualResults: tags}) {
 			break
 		}
-		for it.NextResult() == true {
-			if ses.doHalt {
+		for it.NextPath() {
+			select {
+			case <-wk.kill:
 				return
+			default:
 			}
 			tags := make(map[string]graph.Value)
 			it.TagResults(tags)
-			cont := ses.SendResult(&GremlinResult{metaresult: false, err: "", val: nil, actualResults: &tags})
-			if !cont {
+			if !wk.send(&Result{actualResults: tags}) {
 				break
 			}
 		}
+	}
+	if glog.V(2) {
+		bytes, _ := json.MarshalIndent(graph.DumpStats(it), "", "  ")
+		glog.V(2).Infoln(string(bytes))
 	}
 	it.Close()
 }

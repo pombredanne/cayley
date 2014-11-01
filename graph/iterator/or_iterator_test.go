@@ -23,23 +23,19 @@ import (
 
 func iterated(it graph.Iterator) []int {
 	var res []int
-	for {
-		val, ok := it.Next()
-		if !ok {
-			break
-		}
-		res = append(res, val.(int))
+	for graph.Next(it) {
+		res = append(res, it.Result().(int))
 	}
 	return res
 }
 
 func TestOrIteratorBasics(t *testing.T) {
 	or := NewOr()
-	f1 := newFixed()
+	f1 := NewFixed(Identity)
 	f1.Add(1)
 	f1.Add(2)
 	f1.Add(3)
-	f2 := newFixed()
+	f2 := NewFixed(Identity)
 	f2.Add(3)
 	f2.Add(9)
 	f2.Add(20)
@@ -66,13 +62,13 @@ func TestOrIteratorBasics(t *testing.T) {
 	}
 
 	for _, v := range []int{2, 3, 21} {
-		if !or.Check(v) {
+		if !or.Contains(v) {
 			t.Errorf("Failed to correctly check %d as true", v)
 		}
 	}
 
 	for _, v := range []int{22, 5, 0} {
-		if or.Check(v) {
+		if or.Contains(v) {
 			t.Errorf("Failed to correctly check %d as false", v)
 		}
 	}
@@ -81,11 +77,11 @@ func TestOrIteratorBasics(t *testing.T) {
 func TestShortCircuitingOrBasics(t *testing.T) {
 	var or *Or
 
-	f1 := newFixed()
+	f1 := NewFixed(Identity)
 	f1.Add(1)
 	f1.Add(2)
 	f1.Add(3)
-	f2 := newFixed()
+	f2 := NewFixed(Identity)
 	f2.Add(3)
 	f2.Add(9)
 	f2.Add(20)
@@ -125,19 +121,19 @@ func TestShortCircuitingOrBasics(t *testing.T) {
 	or.AddSubIterator(f1)
 	or.AddSubIterator(f2)
 	for _, v := range []int{2, 3, 21} {
-		if !or.Check(v) {
+		if !or.Contains(v) {
 			t.Errorf("Failed to correctly check %d as true", v)
 		}
 	}
 	for _, v := range []int{22, 5, 0} {
-		if or.Check(v) {
+		if or.Contains(v) {
 			t.Errorf("Failed to correctly check %d as false", v)
 		}
 	}
 
 	// Check that it pulls the second iterator's numbers if the first is empty.
 	or = NewShortCircuitOr()
-	or.AddSubIterator(newFixed())
+	or.AddSubIterator(NewFixed(Identity))
 	or.AddSubIterator(f2)
 	expect = []int{3, 9, 20, 21}
 	for i := 0; i < 2; i++ {

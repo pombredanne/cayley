@@ -23,17 +23,18 @@ import (
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/quad"
 )
 
 func (q *Query) buildFixed(s string) graph.Iterator {
-	f := q.ses.ts.FixedIterator()
-	f.Add(q.ses.ts.ValueOf(s))
+	f := q.ses.qs.FixedIterator()
+	f.Add(q.ses.qs.ValueOf(s))
 	return f
 }
 
 func (q *Query) buildResultIterator(path Path) graph.Iterator {
-	all := q.ses.ts.NodesAllIterator()
-	all.AddTag(string(path))
+	all := q.ses.qs.NodesAllIterator()
+	all.Tagger().Add(string(path))
 	return all
 }
 
@@ -46,7 +47,7 @@ func (q *Query) BuildIteratorTree(query interface{}) {
 	var isOptional bool
 	q.it, isOptional, q.err = q.buildIteratorTreeInternal(query, NewPath())
 	if isOptional {
-		q.err = errors.New("Optional iterator at the top level?")
+		q.err = errors.New("optional iterator at the top level")
 	}
 }
 
@@ -67,7 +68,7 @@ func (q *Query) buildIteratorTreeInternal(query interface{}, path Path) (it grap
 		// Damn you, Javascript, and your lack of integer values.
 		if math.Floor(t) == t {
 			// Treat it like an integer.
-			it = q.buildFixed(fmt.Sprintf("%d", t))
+			it = q.buildFixed(fmt.Sprintf("%0.f", t))
 		} else {
 			it = q.buildFixed(fmt.Sprintf("%f", t))
 		}
@@ -83,7 +84,7 @@ func (q *Query) buildIteratorTreeInternal(query interface{}, path Path) (it grap
 		} else if len(t) == 1 {
 			it, optional, err = q.buildIteratorTreeInternal(t[0], path)
 		} else {
-			err = errors.New(fmt.Sprintf("Multiple fields at location root%s", path.DisplayString()))
+			err = fmt.Errorf("multiple fields at location root %s", path.DisplayString())
 		}
 	case map[string]interface{}:
 		// for JSON objects
@@ -97,13 +98,13 @@ func (q *Query) buildIteratorTreeInternal(query interface{}, path Path) (it grap
 	if err != nil {
 		return nil, false, err
 	}
-	it.AddTag(string(path))
+	it.Tagger().Add(string(path))
 	return it, optional, nil
 }
 
 func (q *Query) buildIteratorTreeMapInternal(query map[string]interface{}, path Path) (graph.Iterator, error) {
 	it := iterator.NewAnd()
-	it.AddSubIterator(q.ses.ts.NodesAllIterator())
+	it.AddSubIterator(q.ses.qs.NodesAllIterator())
 	var err error
 	err = nil
 	outputStructure := make(map[string]interface{})
@@ -137,18 +138,18 @@ func (q *Query) buildIteratorTreeMapInternal(query map[string]interface{}, path 
 				return nil, err
 			}
 			subAnd := iterator.NewAnd()
-			predFixed := q.ses.ts.FixedIterator()
-			predFixed.Add(q.ses.ts.ValueOf(pred))
-			subAnd.AddSubIterator(iterator.NewLinksTo(q.ses.ts, predFixed, graph.Predicate))
+			predFixed := q.ses.qs.FixedIterator()
+			predFixed.Add(q.ses.qs.ValueOf(pred))
+			subAnd.AddSubIterator(iterator.NewLinksTo(q.ses.qs, predFixed, quad.Predicate))
 			if reverse {
-				lto := iterator.NewLinksTo(q.ses.ts, builtIt, graph.Subject)
+				lto := iterator.NewLinksTo(q.ses.qs, builtIt, quad.Subject)
 				subAnd.AddSubIterator(lto)
-				hasa := iterator.NewHasA(q.ses.ts, subAnd, graph.Object)
+				hasa := iterator.NewHasA(q.ses.qs, subAnd, quad.Object)
 				subit = hasa
 			} else {
-				lto := iterator.NewLinksTo(q.ses.ts, builtIt, graph.Object)
+				lto := iterator.NewLinksTo(q.ses.qs, builtIt, quad.Object)
 				subAnd.AddSubIterator(lto)
-				hasa := iterator.NewHasA(q.ses.ts, subAnd, graph.Subject)
+				hasa := iterator.NewHasA(q.ses.qs, subAnd, quad.Subject)
 				subit = hasa
 			}
 		}
@@ -165,13 +166,13 @@ func (q *Query) buildIteratorTreeMapInternal(query map[string]interface{}, path 
 	return it, nil
 }
 
-type ResultPathSlice []ResultPath
+type byRecordLength []ResultPath
 
-func (p ResultPathSlice) Len() int {
+func (p byRecordLength) Len() int {
 	return len(p)
 }
 
-func (p ResultPathSlice) Less(i, j int) bool {
+func (p byRecordLength) Less(i, j int) bool {
 	iLen := len(strings.Split(string(p[i]), "\x30"))
 	jLen := len(strings.Split(string(p[j]), "\x30"))
 	if iLen < jLen {
@@ -185,6 +186,6 @@ func (p ResultPathSlice) Less(i, j int) bool {
 	return false
 }
 
-func (p ResultPathSlice) Swap(i, j int) {
+func (p byRecordLength) Swap(i, j int) {
 	p[i], p[j] = p[j], p[i]
 }
