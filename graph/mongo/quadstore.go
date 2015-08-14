@@ -17,6 +17,7 @@ package mongo
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"hash"
 	"sync"
 
@@ -26,15 +27,15 @@ import (
 	"github.com/barakmich/glog"
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/keys"
 	"github.com/google/cayley/quad"
 )
 
-func init() {
-	graph.RegisterQuadStore("mongo", true, newQuadStore, createNewMongoGraph)
-}
-
 const DefaultDBName = "cayley"
+const QuadStoreType = "mongo"
+
+func init() {
+	graph.RegisterQuadStore(QuadStoreType, true, newQuadStore, createNewMongoGraph, nil)
+}
 
 var (
 	hashPool = sync.Pool{
@@ -47,6 +48,7 @@ type QuadStore struct {
 	session *mgo.Session
 	db      *mgo.Database
 	ids     *cache
+	sizes   *cache
 }
 
 func createNewMongoGraph(addr string, options graph.Options) error {
@@ -56,7 +58,10 @@ func createNewMongoGraph(addr string, options graph.Options) error {
 	}
 	conn.SetSafe(&mgo.Safe{})
 	dbName := DefaultDBName
-	if val, ok := options.StringKey("database_name"); ok {
+	val, ok, err := options.StringKey("database_name")
+	if err != nil {
+		return err
+	} else if ok {
 		dbName = val
 	}
 	db := conn.DB(dbName)
@@ -93,12 +98,16 @@ func newQuadStore(addr string, options graph.Options) (graph.QuadStore, error) {
 	}
 	conn.SetSafe(&mgo.Safe{})
 	dbName := DefaultDBName
-	if val, ok := options.StringKey("database_name"); ok {
+	val, ok, err := options.StringKey("database_name")
+	if err != nil {
+		return nil, err
+	} else if ok {
 		dbName = val
 	}
 	qs.db = conn.DB(dbName)
 	qs.session = conn
 	qs.ids = newCache(1 << 16)
+	qs.sizes = newCache(1 << 16)
 	return &qs, nil
 }
 
@@ -213,20 +222,31 @@ func (qs *QuadStore) updateLog(d graph.Delta) error {
 	return err
 }
 
-func (qs *QuadStore) ApplyDeltas(in []graph.Delta) error {
+func (qs *QuadStore) ApplyDeltas(in []graph.Delta, ignoreOpts graph.IgnoreOpts) error {
 	qs.session.SetSafe(nil)
 	ids := make(map[string]int)
 	// Pre-check the existence condition.
 	for _, d := range in {
+		if d.Action != graph.Add && d.Action != graph.Delete {
+			return errors.New("mongo: invalid action")
+		}
 		key := qs.getIDForQuad(d.Quad)
 		switch d.Action {
 		case graph.Add:
 			if qs.checkValid(key) {
-				return graph.ErrQuadExists
+				if ignoreOpts.IgnoreDup {
+					continue
+				} else {
+					return graph.ErrQuadExists
+				}
 			}
 		case graph.Delete:
 			if !qs.checkValid(key) {
-				return graph.ErrQuadNotExist
+				if ignoreOpts.IgnoreMissing {
+					continue
+				} else {
+					return graph.ErrQuadNotExist
+				}
 			}
 		}
 	}
@@ -295,14 +315,15 @@ func (qs *QuadStore) ValueOf(s string) graph.Value {
 func (qs *QuadStore) NameOf(v graph.Value) string {
 	val, ok := qs.ids.Get(v.(string))
 	if ok {
-		return val
+		return val.(string)
 	}
 	var node MongoNode
 	err := qs.db.C("nodes").FindId(v.(string)).One(&node)
 	if err != nil {
 		glog.Errorf("Error: Couldn't retrieve node %s %v", v, err)
+	} else if node.ID != "" && node.Name != "" {
+		qs.ids.Put(v.(string), node.Name)
 	}
-	qs.ids.Put(v.(string), node.Name)
 	return node.Name
 }
 
@@ -321,11 +342,11 @@ func (qs *QuadStore) Horizon() graph.PrimaryKey {
 	err := qs.db.C("log").Find(nil).Sort("-LogID").One(&log)
 	if err != nil {
 		if err == mgo.ErrNotFound {
-			return keys.NewSequentialKey(0)
+			return graph.NewSequentialKey(0)
 		}
 		glog.Errorf("Could not get Horizon from Mongo: %v", err)
 	}
-	return keys.NewSequentialKey(log.LogID)
+	return graph.NewSequentialKey(log.LogID)
 }
 
 func (qs *QuadStore) FixedIterator() graph.FixedIterator {
@@ -354,3 +375,31 @@ func (qs *QuadStore) QuadDirection(in graph.Value, d quad.Direction) graph.Value
 }
 
 // TODO(barakmich): Rewrite bulk loader. For now, iterating around blocks is the way we'll go about it.
+
+func (qs *QuadStore) Type() string {
+	return QuadStoreType
+}
+
+func (qs *QuadStore) getSize(collection string, constraint bson.M) (int64, error) {
+	var size int
+	bytes, err := bson.Marshal(constraint)
+	if err != nil {
+		glog.Errorf("Couldn't marshal internal constraint")
+		return -1, err
+	}
+	key := collection + string(bytes)
+	if val, ok := qs.sizes.Get(key); ok {
+		return val.(int64), nil
+	}
+	if constraint == nil {
+		size, err = qs.db.C(collection).Count()
+	} else {
+		size, err = qs.db.C(collection).Find(constraint).Count()
+	}
+	if err != nil {
+		glog.Errorln("Trouble getting size for iterator! ", err)
+		return -1, err
+	}
+	qs.sizes.Put(key, int64(size))
+	return int64(size), nil
+}

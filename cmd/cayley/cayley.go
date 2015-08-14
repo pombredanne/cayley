@@ -17,29 +17,19 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"compress/bzip2"
-	"compress/gzip"
 	"flag"
 	"fmt"
-	"io"
-	client "net/http"
-	"net/url"
 	"os"
-	"path/filepath"
 	"runtime"
 	"time"
 
 	"github.com/barakmich/glog"
 
-	"github.com/google/cayley/config"
-	"github.com/google/cayley/db"
 	"github.com/google/cayley/graph"
-	"github.com/google/cayley/http"
-	"github.com/google/cayley/quad"
-	"github.com/google/cayley/quad/cquads"
-	"github.com/google/cayley/quad/nquads"
+	"github.com/google/cayley/internal"
+	"github.com/google/cayley/internal/config"
+	"github.com/google/cayley/internal/db"
+	"github.com/google/cayley/internal/http"
 
 	// Load all supported backends.
 	_ "github.com/google/cayley/graph/bolt"
@@ -195,7 +185,7 @@ func main() {
 			if err != nil {
 				break
 			}
-			err = load(handle.QuadWriter, cfg, *quadFile, *quadType)
+			err = internal.Load(handle.QuadWriter, cfg, *quadFile, *quadType)
 			if err != nil {
 				break
 			}
@@ -207,7 +197,7 @@ func main() {
 		if err != nil {
 			break
 		}
-		err = load(handle.QuadWriter, cfg, *quadFile, *quadType)
+		err = internal.Load(handle.QuadWriter, cfg, *quadFile, *quadType)
 		if err != nil {
 			break
 		}
@@ -220,7 +210,7 @@ func main() {
 			break
 		}
 		if !graph.IsPersistent(cfg.DatabaseType) {
-			err = load(handle.QuadWriter, cfg, "", *quadType)
+			err = internal.Load(handle.QuadWriter, cfg, "", *quadType)
 			if err != nil {
 				break
 			}
@@ -236,7 +226,7 @@ func main() {
 			break
 		}
 		if !graph.IsPersistent(cfg.DatabaseType) {
-			err = load(handle.QuadWriter, cfg, "", *quadType)
+			err = internal.Load(handle.QuadWriter, cfg, "", *quadType)
 			if err != nil {
 				break
 			}
@@ -252,79 +242,5 @@ func main() {
 	}
 	if err != nil {
 		glog.Errorln(err)
-	}
-}
-
-func load(qw graph.QuadWriter, cfg *config.Config, path, typ string) error {
-	return decompressAndLoad(qw, cfg, path, typ, db.Load)
-}
-
-func decompressAndLoad(qw graph.QuadWriter, cfg *config.Config, path, typ string, loadFn func(graph.QuadWriter, *config.Config, quad.Unmarshaler) error) error {
-	var r io.Reader
-
-	if path == "" {
-		path = cfg.DatabasePath
-	}
-	if path == "" {
-		return nil
-	}
-	u, err := url.Parse(path)
-	if err != nil || u.Scheme == "file" || u.Scheme == "" {
-		// Don't alter relative URL path or non-URL path parameter.
-		if u.Scheme != "" && err == nil {
-			// Recovery heuristic for mistyping "file://path/to/file".
-			path = filepath.Join(u.Host, u.Path)
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return fmt.Errorf("could not open file %q: %v", path, err)
-		}
-		defer f.Close()
-		r = f
-	} else {
-		res, err := client.Get(path)
-		if err != nil {
-			return fmt.Errorf("could not get resource <%s>: %v", u, err)
-		}
-		defer res.Body.Close()
-		r = res.Body
-	}
-
-	r, err = decompressor(r)
-	if err != nil {
-		return err
-	}
-
-	var dec quad.Unmarshaler
-	switch typ {
-	case "cquad":
-		dec = cquads.NewDecoder(r)
-	case "nquad":
-		dec = nquads.NewDecoder(r)
-	default:
-		return fmt.Errorf("unknown quad format %q", typ)
-	}
-
-	return db.Load(qw, cfg, dec)
-}
-
-const (
-	gzipMagic  = "\x1f\x8b"
-	b2zipMagic = "BZh"
-)
-
-func decompressor(r io.Reader) (io.Reader, error) {
-	br := bufio.NewReader(r)
-	buf, err := br.Peek(3)
-	if err != nil {
-		return nil, err
-	}
-	switch {
-	case bytes.Compare(buf[:2], []byte(gzipMagic)) == 0:
-		return gzip.NewReader(br)
-	case bytes.Compare(buf[:3], []byte(b2zipMagic)) == 0:
-		return bzip2.NewReader(br), nil
-	default:
-		return br, nil
 	}
 }

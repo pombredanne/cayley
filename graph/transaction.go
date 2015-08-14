@@ -1,4 +1,4 @@
-// Copyright 2014 The Cayley Authors. All rights reserved.
+// Copyright 2015 The Cayley Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,26 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build appengine
-
-package main
+package graph
 
 import (
-	"github.com/barakmich/glog"
-
-	"github.com/google/cayley/config"
-	"github.com/google/cayley/db"
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/http"
-
-	_ "github.com/google/cayley/graph/memstore"
+	"github.com/google/cayley/quad"
 )
 
-func init() {
-	glog.SetToStderr(true)
-	cfg := config.ParseConfigFromFile("cayley_appengine.cfg")
-	qs, _ := graph.NewQuadStore("memstore", "", nil)
-	glog.Errorln(cfg)
-	db.Load(qs, cfg, cfg.DatabasePath)
-	http.SetupRoutes(qs, cfg)
+type Transaction struct {
+	Deltas []Delta
+}
+
+func NewTransaction() *Transaction {
+	return &Transaction{make([]Delta, 0, 5)}
+}
+
+func (t *Transaction) AddQuad(q quad.Quad) {
+	t.Deltas = append(t.Deltas,
+		Delta{
+			Quad:   q,
+			Action: Add,
+		})
+}
+
+func (t *Transaction) RemoveQuad(q quad.Quad) {
+	t.Deltas = append(t.Deltas,
+		Delta{
+			Quad:   q,
+			Action: Delete,
+		})
 }

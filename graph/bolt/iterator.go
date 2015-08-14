@@ -50,6 +50,7 @@ type Iterator struct {
 	offset  int
 	done    bool
 	size    int64
+	err     error
 }
 
 func NewIterator(bucket []byte, d quad.Direction, value graph.Value, qs *QuadStore) *Iterator {
@@ -105,10 +106,11 @@ func (it *Iterator) Clone() graph.Iterator {
 	return out
 }
 
-func (it *Iterator) Close() {
+func (it *Iterator) Close() error {
 	it.result = nil
 	it.buffer = nil
 	it.done = true
+	return nil
 }
 
 func (it *Iterator) isLiveValue(val []byte) bool {
@@ -133,13 +135,15 @@ func (it *Iterator) Next() bool {
 			b := tx.Bucket(it.bucket)
 			cur := b.Cursor()
 			if last == nil {
-				k, _ := cur.Seek(it.checkID)
+				k, v := cur.Seek(it.checkID)
 				if bytes.HasPrefix(k, it.checkID) {
-					var out []byte
-					out = make([]byte, len(k))
-					copy(out, k)
-					it.buffer = append(it.buffer, out)
-					i++
+					if it.isLiveValue(v) {
+						var out []byte
+						out = make([]byte, len(k))
+						copy(out, k)
+						it.buffer = append(it.buffer, out)
+						i++
+					}
 				} else {
 					it.buffer = append(it.buffer, nil)
 					return errNotExist
@@ -170,6 +174,7 @@ func (it *Iterator) Next() bool {
 		if err != nil {
 			if err != errNotExist {
 				glog.Errorf("Error nexting in database: %v", err)
+				it.err = err
 			}
 			it.done = true
 			return false
@@ -184,8 +189,8 @@ func (it *Iterator) Next() bool {
 	return true
 }
 
-func (it *Iterator) ResultTree() *graph.ResultTree {
-	return graph.NewResultTree(it.Result())
+func (it *Iterator) Err() error {
+	return it.err
 }
 
 func (it *Iterator) Result() graph.Value {
@@ -316,3 +321,5 @@ func (it *Iterator) Stats() graph.IteratorStats {
 		Size:         s,
 	}
 }
+
+var _ graph.Nexter = &Iterator{}

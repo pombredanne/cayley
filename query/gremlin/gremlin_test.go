@@ -15,43 +15,33 @@
 package gremlin
 
 import (
+	"io"
+	"os"
 	"reflect"
 	"sort"
 	"testing"
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/quad"
+	"github.com/google/cayley/quad/cquads"
 
 	_ "github.com/google/cayley/graph/memstore"
 	_ "github.com/google/cayley/writer"
 )
 
-// This is a simple test graph.
+// This is a simple test graph used for testing the gremlin queries
 //
-//    +---+                        +---+
-//    | A |-------               ->| F |<--
-//    +---+       \------>+---+-/  +---+   \--+---+
-//                 ------>|#B#|      |        | E |
-//    +---+-------/      >+---+      |        +---+
-//    | C |             /            v
-//    +---+           -/           +---+
-//      ----    +---+/             |#G#|
-//          \-->|#D#|------------->+---+
-//              +---+
+//  +-------+                        +------+
+//  | alice |-----                 ->| fred |<--
+//  +-------+     \---->+-------+-/  +------+   \-+-------+
+//                ----->| #bob# |       |         | emily |
+//  +---------+--/  --->+-------+       |         +-------+
+//  | charlie |    /                    v
+//  +---------+   /                  +--------+
+//    \---    +--------+             | #greg# |
+//        \-->| #dani# |------------>+--------+
+//            +--------+
 //
-var simpleGraph = []quad.Quad{
-	{"A", "follows", "B", ""},
-	{"C", "follows", "B", ""},
-	{"C", "follows", "D", ""},
-	{"D", "follows", "B", ""},
-	{"B", "follows", "F", ""},
-	{"F", "follows", "G", ""},
-	{"D", "follows", "G", ""},
-	{"E", "follows", "F", ""},
-	{"B", "status", "cool", "status_graph"},
-	{"D", "status", "cool", "status_graph"},
-	{"G", "status", "cool", "status_graph"},
-}
 
 func makeTestSession(data []quad.Quad) *Session {
 	qs, _ := graph.NewQuadStore("memstore", "", nil)
@@ -72,53 +62,67 @@ var testQueries = []struct {
 	{
 		message: "get a single vertex",
 		query: `
-			g.V("A").All()
+			g.V("alice").All()
 		`,
-		expect: []string{"A"},
+		expect: []string{"alice"},
 	},
 	{
 		message: "use .Out()",
 		query: `
-			g.V("A").Out("follows").All()
+			g.V("alice").Out("follows").All()
 		`,
-		expect: []string{"B"},
+		expect: []string{"bob"},
 	},
 	{
 		message: "use .In()",
 		query: `
-			g.V("B").In("follows").All()
+			g.V("bob").In("follows").All()
 		`,
-		expect: []string{"A", "C", "D"},
+		expect: []string{"alice", "charlie", "dani"},
 	},
 	{
 		message: "use .Both()",
 		query: `
-			g.V("F").Both("follows").All()
+			g.V("fred").Both("follows").All()
 		`,
-		expect: []string{"B", "G", "E"},
+		expect: []string{"bob", "greg", "emily"},
 	},
 	{
 		message: "use .Tag()-.Is()-.Back()",
 		query: `
-			g.V("B").In("follows").Tag("foo").Out("status").Is("cool").Back("foo").All()
+			g.V("bob").In("follows").Tag("foo").Out("status").Is("cool_person").Back("foo").All()
 		`,
-		expect: []string{"D"},
+		expect: []string{"dani"},
 	},
 	{
 		message: "separate .Tag()-.Is()-.Back()",
 		query: `
-			x = g.V("C").Out("follows").Tag("foo").Out("status").Is("cool").Back("foo")
-			x.In("follows").Is("D").Back("foo").All()
+			x = g.V("charlie").Out("follows").Tag("foo").Out("status").Is("cool_person").Back("foo")
+			x.In("follows").Is("dani").Back("foo").All()
 		`,
-		expect: []string{"B"},
+		expect: []string{"bob"},
 	},
 	{
 		message: "do multiple .Back()s",
 		query: `
-			g.V("E").Out("follows").As("f").Out("follows").Out("status").Is("cool").Back("f").In("follows").In("follows").As("acd").Out("status").Is("cool").Back("f").All()
+			g.V("emily").Out("follows").As("f").Out("follows").Out("status").Is("cool_person").Back("f").In("follows").In("follows").As("acd").Out("status").Is("cool_person").Back("f").All()
 		`,
 		tag:    "acd",
-		expect: []string{"D"},
+		expect: []string{"dani"},
+	},
+	{
+		message: "use Except to filter out a single vertex",
+		query: `
+			g.V("alice", "bob").Except(g.V("alice")).All()
+		`,
+		expect: []string{"bob"},
+	},
+	{
+		message: "use chained Except",
+		query: `
+			g.V("alice", "bob", "charlie").Except(g.V("bob")).Except(g.V("charlie")).All()
+		`,
+		expect: []string{"alice"},
 	},
 
 	// Morphism tests.
@@ -126,17 +130,17 @@ var testQueries = []struct {
 		message: "show simple morphism",
 		query: `
 			grandfollows = g.M().Out("follows").Out("follows")
-			g.V("C").Follow(grandfollows).All()
+			g.V("charlie").Follow(grandfollows).All()
 		`,
-		expect: []string{"G", "F", "B"},
+		expect: []string{"greg", "fred", "bob"},
 	},
 	{
 		message: "show reverse morphism",
 		query: `
 			grandfollows = g.M().Out("follows").Out("follows")
-			g.V("F").FollowR(grandfollows).All()
+			g.V("fred").FollowR(grandfollows).All()
 		`,
-		expect: []string{"A", "C", "D"},
+		expect: []string{"alice", "charlie", "dani"},
 	},
 
 	// Intersection tests.
@@ -144,59 +148,59 @@ var testQueries = []struct {
 		message: "show simple intersection",
 		query: `
 			function follows(x) { return g.V(x).Out("follows") }
-			follows("D").And(follows("C")).All()
+			follows("dani").And(follows("charlie")).All()
 		`,
-		expect: []string{"B"},
+		expect: []string{"bob"},
 	},
 	{
 		message: "show simple morphism intersection",
 		query: `
 			grandfollows = g.M().Out("follows").Out("follows")
 			function gfollows(x) { return g.V(x).Follow(grandfollows) }
-			gfollows("A").And(gfollows("C")).All()
+			gfollows("alice").And(gfollows("charlie")).All()
 		`,
-		expect: []string{"F"},
+		expect: []string{"fred"},
 	},
 	{
 		message: "show double morphism intersection",
 		query: `
 			grandfollows = g.M().Out("follows").Out("follows")
 			function gfollows(x) { return g.V(x).Follow(grandfollows) }
-			gfollows("E").And(gfollows("C")).And(gfollows("B")).All()
+			gfollows("emily").And(gfollows("charlie")).And(gfollows("bob")).All()
 		`,
-		expect: []string{"G"},
+		expect: []string{"greg"},
 	},
 	{
 		message: "show reverse intersection",
 		query: `
 			grandfollows = g.M().Out("follows").Out("follows")
-			g.V("G").FollowR(grandfollows).Intersect(g.V("F").FollowR(grandfollows)).All()
+			g.V("greg").FollowR(grandfollows).Intersect(g.V("fred").FollowR(grandfollows)).All()
 		`,
-		expect: []string{"C"},
+		expect: []string{"charlie"},
 	},
 	{
 		message: "show standard sort of morphism intersection, continue follow",
 		query: `gfollowers = g.M().In("follows").In("follows")
-			function cool(x) { return g.V(x).As("a").Out("status").Is("cool").Back("a") }
-			cool("G").Follow(gfollowers).Intersect(cool("B").Follow(gfollowers)).All()
+			function cool(x) { return g.V(x).As("a").Out("status").Is("cool_person").Back("a") }
+			cool("greg").Follow(gfollowers).Intersect(cool("bob").Follow(gfollowers)).All()
 		`,
-		expect: []string{"C"},
+		expect: []string{"charlie"},
 	},
 
 	// Gremlin Has tests.
 	{
 		message: "show a simple Has",
 		query: `
-				g.V().Has("status", "cool").All()
+				g.V().Has("status", "cool_person").All()
 		`,
-		expect: []string{"G", "D", "B"},
+		expect: []string{"greg", "dani", "bob"},
 	},
 	{
 		message: "show a double Has",
 		query: `
-				g.V().Has("status", "cool").Has("follows", "F").All()
+				g.V().Has("status", "cool_person").Has("follows", "fred").All()
 		`,
-		expect: []string{"B"},
+		expect: []string{"bob"},
 	},
 
 	// Tag tests.
@@ -206,20 +210,20 @@ var testQueries = []struct {
 			g.V().Save("status", "somecool").All()
 		`,
 		tag:    "somecool",
-		expect: []string{"cool", "cool", "cool"},
+		expect: []string{"cool_person", "cool_person", "cool_person"},
 	},
 	{
 		message: "show a simple saveR",
 		query: `
-			g.V("cool").SaveR("status", "who").All()
+			g.V("cool_person").SaveR("status", "who").All()
 		`,
 		tag:    "who",
-		expect: []string{"G", "D", "B"},
+		expect: []string{"greg", "dani", "bob"},
 	},
 	{
 		message: "show an out save",
 		query: `
-			g.V("D").Out(null, "pred").All()
+			g.V("dani").Out(null, "pred").All()
 		`,
 		tag:    "pred",
 		expect: []string{"follows", "follows", "status"},
@@ -227,7 +231,7 @@ var testQueries = []struct {
 	{
 		message: "show a tag list",
 		query: `
-			g.V("D").Out(null, ["pred", "foo", "bar"]).All()
+			g.V("dani").Out(null, ["pred", "foo", "bar"]).All()
 		`,
 		tag:    "foo",
 		expect: []string{"follows", "follows", "status"},
@@ -235,23 +239,44 @@ var testQueries = []struct {
 	{
 		message: "show a pred list",
 		query: `
-			g.V("D").Out(["follows", "status"]).All()
+			g.V("dani").Out(["follows", "status"]).All()
 		`,
-		expect: []string{"B", "G", "cool"},
+		expect: []string{"bob", "greg", "cool_person"},
 	},
 	{
 		message: "show a predicate path",
 		query: `
-			g.V("D").Out(g.V("follows"), "pred").All()
+			g.V("dani").Out(g.V("follows"), "pred").All()
 		`,
-		expect: []string{"B", "G"},
+		expect: []string{"bob", "greg"},
+	},
+	{
+		message: "list all bob's incoming predicates",
+		query: `
+		  g.V("bob").InPredicates().All()
+		`,
+		expect: []string{"follows"},
+	},
+	{
+		message: "list all in predicates",
+		query: `
+		  g.V().InPredicates().All()
+		`,
+		expect: []string{"follows", "status"},
+	},
+	{
+		message: "list all out predicates",
+		query: `
+		  g.V().OutPredicates().All()
+		`,
+		expect: []string{"follows", "status"},
 	},
 }
 
 func runQueryGetTag(g []quad.Quad, query string, tag string) []string {
 	js := makeTestSession(g)
 	c := make(chan interface{}, 5)
-	js.ExecInput(query, c, -1)
+	js.Execute(query, c, -1)
 
 	var results []string
 	for res := range c {
@@ -267,7 +292,29 @@ func runQueryGetTag(g []quad.Quad, query string, tag string) []string {
 	return results
 }
 
+func loadGraph(path string, t testing.TB) []quad.Quad {
+	var r io.Reader
+	var simpleGraph []quad.Quad
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Failed to open %q: %v", path, err)
+	}
+	defer f.Close()
+	r = f
+
+	dec := cquads.NewDecoder(r)
+	q1, err := dec.Unmarshal()
+	if err != nil {
+		t.Fatalf("Failed to Unmarshal: %v", err)
+	}
+	for ; err == nil; q1, err = dec.Unmarshal() {
+		simpleGraph = append(simpleGraph, q1)
+	}
+	return simpleGraph
+}
+
 func TestGremlin(t *testing.T) {
+	simpleGraph := loadGraph("../../data/testdata.nq", t)
 	for _, test := range testQueries {
 		if test.tag == "" {
 			test.tag = TopResultTag
@@ -304,7 +351,7 @@ func TestIssue160(t *testing.T) {
 
 	ses := makeTestSession(issue160TestGraph)
 	c := make(chan interface{}, 5)
-	go ses.ExecInput(query, c, 100)
+	go ses.Execute(query, c, 100)
 	var got []string
 	for res := range c {
 		func() {
@@ -313,7 +360,7 @@ func TestIssue160(t *testing.T) {
 					t.Errorf("Unexpected panic: %v", r)
 				}
 			}()
-			got = append(got, ses.ToText(res))
+			got = append(got, ses.Format(res))
 		}()
 	}
 	sort.Strings(got)

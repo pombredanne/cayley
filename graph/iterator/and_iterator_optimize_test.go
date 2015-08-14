@@ -26,10 +26,14 @@ import (
 )
 
 func TestIteratorPromotion(t *testing.T) {
+	qs := &store{
+		data: []string{},
+		iter: NewFixed(Identity),
+	}
 	all := NewInt64(1, 3)
 	fixed := NewFixed(Identity)
 	fixed.Add(3)
-	a := NewAnd()
+	a := NewAnd(qs)
 	a.AddSubIterator(all)
 	a.AddSubIterator(fixed)
 	all.Tagger().Add("a")
@@ -51,9 +55,13 @@ func TestIteratorPromotion(t *testing.T) {
 }
 
 func TestNullIteratorAnd(t *testing.T) {
+	qs := &store{
+		data: []string{},
+		iter: NewFixed(Identity),
+	}
 	all := NewInt64(1, 3)
 	null := NewNull()
-	a := NewAnd()
+	a := NewAnd(qs)
 	a.AddSubIterator(all)
 	a.AddSubIterator(null)
 	newIt, changed := a.Optimize()
@@ -65,12 +73,53 @@ func TestNullIteratorAnd(t *testing.T) {
 	}
 }
 
-func TestReorderWithTag(t *testing.T) {
+func TestAllPromotion(t *testing.T) {
+	qs := &store{
+		data: []string{},
+		iter: NewFixed(Identity),
+	}
 	all := NewInt64(100, 300)
 	all.Tagger().Add("good")
 	all2 := NewInt64(1, 30000)
 	all2.Tagger().Add("slow")
-	a := NewAnd()
+	a := NewAnd(qs)
+	// Make all2 the default iterator
+	a.AddSubIterator(all2)
+	a.AddSubIterator(all)
+
+	newIt, changed := a.Optimize()
+	if !changed {
+		t.Error("Expected new iterator")
+	}
+	if newIt.Type() != graph.All {
+		t.Error("Should have promoted the All iterator")
+	}
+	expectedTags := []string{"good", "slow"}
+	tagsOut := make([]string, 0)
+	for _, x := range newIt.Tagger().Tags() {
+		tagsOut = append(tagsOut, x)
+	}
+	sort.Strings(tagsOut)
+	if !reflect.DeepEqual(expectedTags, tagsOut) {
+		t.Fatalf("Tags don't match: expected: %#v, got: %#v", expectedTags, tagsOut)
+	}
+}
+
+func TestReorderWithTag(t *testing.T) {
+	qs := &store{
+		data: []string{},
+		iter: NewFixed(Identity),
+	}
+	all := NewFixed(Identity)
+	all.Add(3)
+	all.Tagger().Add("good")
+	all2 := NewFixed(Identity)
+	all2.Tagger().Add("slow")
+	all2.Add(3)
+	all2.Add(4)
+	all2.Add(5)
+	all2.Add(6)
+	a := NewAnd(qs)
 	// Make all2 the default iterator
 	a.AddSubIterator(all2)
 	a.AddSubIterator(all)
@@ -86,17 +135,25 @@ func TestReorderWithTag(t *testing.T) {
 			tagsOut = append(tagsOut, x)
 		}
 	}
+	for _, x := range newIt.Tagger().Tags() {
+		tagsOut = append(tagsOut, x)
+	}
+	sort.Strings(tagsOut)
 	if !reflect.DeepEqual(expectedTags, tagsOut) {
-		t.Fatal("Tags don't match")
+		t.Fatalf("Tags don't match: expected: %#v, got: %#v", expectedTags, tagsOut)
 	}
 }
 
 func TestAndStatistics(t *testing.T) {
+	qs := &store{
+		data: []string{},
+		iter: NewFixed(Identity),
+	}
 	all := NewInt64(100, 300)
 	all.Tagger().Add("good")
 	all2 := NewInt64(1, 30000)
 	all2.Tagger().Add("slow")
-	a := NewAnd()
+	a := NewAnd(qs)
 	// Make all2 the default iterator
 	a.AddSubIterator(all2)
 	a.AddSubIterator(all)

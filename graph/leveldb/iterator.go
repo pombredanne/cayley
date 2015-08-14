@@ -109,11 +109,12 @@ func (it *Iterator) Clone() graph.Iterator {
 	return out
 }
 
-func (it *Iterator) Close() {
+func (it *Iterator) Close() error {
 	if it.open {
 		it.iter.Release()
 		it.open = false
 	}
+	return nil
 }
 
 func (it *Iterator) isLiveValue(val []byte) bool {
@@ -138,6 +139,11 @@ func (it *Iterator) Next() bool {
 	}
 	if bytes.HasPrefix(it.iter.Key(), it.nextPrefix) {
 		if !it.isLiveValue(it.iter.Value()) {
+			ok := it.iter.Next()
+			if !ok {
+				it.Close()
+				return false
+			}
 			return it.Next()
 		}
 		out := make([]byte, len(it.iter.Key()))
@@ -154,8 +160,8 @@ func (it *Iterator) Next() bool {
 	return false
 }
 
-func (it *Iterator) ResultTree() *graph.ResultTree {
-	return graph.NewResultTree(it.Result())
+func (it *Iterator) Err() error {
+	return it.iter.Error()
 }
 
 func (it *Iterator) Result() graph.Value {
@@ -193,7 +199,7 @@ func PositionOf(prefix []byte, d quad.Direction, qs *QuadStore) int {
 		case quad.Object:
 			return hashSize + 2
 		case quad.Label:
-			return hashSize + 2
+			return 3*hashSize + 2
 		}
 	}
 	if bytes.Equal(prefix, []byte("os")) {
@@ -283,3 +289,5 @@ func (it *Iterator) Stats() graph.IteratorStats {
 		Size:         s,
 	}
 }
+
+var _ graph.Nexter = &Iterator{}

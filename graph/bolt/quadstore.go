@@ -19,6 +19,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"sync"
@@ -28,13 +29,16 @@ import (
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/keys"
 	"github.com/google/cayley/quad"
 )
 
 func init() {
-	graph.RegisterQuadStore("bolt", true, newQuadStore, createNewBolt)
+	graph.RegisterQuadStore("bolt", true, newQuadStore, createNewBolt, nil)
 }
+
+var (
+	errNoBucket = errors.New("bolt: bucket is missing")
+)
 
 var (
 	hashPool = sync.Pool{
@@ -42,6 +46,10 @@ var (
 	}
 	hashSize         = sha1.Size
 	localFillPercent = 0.7
+)
+
+const (
+	QuadStoreType = "bolt"
 )
 
 type Token struct {
@@ -88,9 +96,14 @@ func newQuadStore(path string, options graph.Options) (graph.QuadStore, error) {
 	}
 	qs.db = db
 	// BoolKey returns false on non-existence. IE, Sync by default.
-	qs.db.NoSync, _ = options.BoolKey("nosync")
-	err = qs.getMetadata()
+	qs.db.NoSync, _, err = options.BoolKey("nosync")
 	if err != nil {
+		return nil, err
+	}
+	err = qs.getMetadata()
+	if err == errNoBucket {
+		panic("bolt: quadstore has not been initialised")
+	} else if err != nil {
 		return nil, err
 	}
 	return &qs, nil
@@ -126,7 +139,7 @@ func (qs *QuadStore) Size() int64 {
 }
 
 func (qs *QuadStore) Horizon() graph.PrimaryKey {
-	return keys.NewSequentialKey(qs.horizon)
+	return graph.NewSequentialKey(qs.horizon)
 }
 
 func (qs *QuadStore) createDeltaKeyFor(id int64) []byte {
@@ -183,7 +196,7 @@ var (
 	metaBucket = []byte("meta")
 )
 
-func (qs *QuadStore) ApplyDeltas(deltas []graph.Delta) error {
+func (qs *QuadStore) ApplyDeltas(deltas []graph.Delta, ignoreOpts graph.IgnoreOpts) error {
 	oldSize := qs.size
 	oldHorizon := qs.horizon
 	err := qs.db.Update(func(tx *bolt.Tx) error {
@@ -192,6 +205,9 @@ func (qs *QuadStore) ApplyDeltas(deltas []graph.Delta) error {
 		resizeMap := make(map[string]int64)
 		sizeChange := int64(0)
 		for _, d := range deltas {
+			if d.Action != graph.Add && d.Action != graph.Delete {
+				return errors.New("bolt: invalid action")
+			}
 			bytes, err := json.Marshal(d)
 			if err != nil {
 				return err
@@ -204,6 +220,12 @@ func (qs *QuadStore) ApplyDeltas(deltas []graph.Delta) error {
 		for _, d := range deltas {
 			err := qs.buildQuadWrite(tx, d.Quad, d.ID.Int(), d.Action == graph.Add)
 			if err != nil {
+				if err == graph.ErrQuadExists && ignoreOpts.IgnoreDup {
+					continue
+				}
+				if err == graph.ErrQuadNotExist && ignoreOpts.IgnoreMissing {
+					continue
+				}
 				return err
 			}
 			delta := int64(1)
@@ -254,11 +276,11 @@ func (qs *QuadStore) buildQuadWrite(tx *bolt.Tx, q quad.Quad, id int64, isAdd bo
 	}
 
 	if isAdd && len(entry.History)%2 == 1 {
-		glog.Error("Adding a valid quad ", entry)
+		glog.Errorf("attempt to add existing quad %v: %#v", entry, q)
 		return graph.ErrQuadExists
 	}
 	if !isAdd && len(entry.History)%2 == 0 {
-		glog.Error("Deleting an invalid quad ", entry)
+		glog.Errorf("attempt to delete non-existent quad %v: %#v", entry, q)
 		return graph.ErrQuadNotExist
 	}
 
@@ -359,7 +381,7 @@ func (qs *QuadStore) Close() {
 }
 
 func (qs *QuadStore) Quad(k graph.Value) quad.Quad {
-	var q quad.Quad
+	var d graph.Delta
 	tok := k.(*Token)
 	err := qs.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(tok.bucket)
@@ -381,13 +403,13 @@ func (qs *QuadStore) Quad(k graph.Value) quad.Quad {
 			// No harm, no foul.
 			return nil
 		}
-		return json.Unmarshal(data, &q)
+		return json.Unmarshal(data, &d)
 	})
 	if err != nil {
 		glog.Error("Error getting quad: ", err)
 		return quad.Quad{}
 	}
-	return q
+	return d.Quad
 }
 
 func (qs *QuadStore) ValueOf(s string) graph.Value {
@@ -435,6 +457,9 @@ func (qs *QuadStore) SizeOf(k graph.Value) int64 {
 func (qs *QuadStore) getInt64ForKey(tx *bolt.Tx, key string, empty int64) (int64, error) {
 	var out int64
 	b := tx.Bucket(metaBucket)
+	if b == nil {
+		return empty, errNoBucket
+	}
 	data := b.Get([]byte(key))
 	if data == nil {
 		return empty, nil
@@ -505,4 +530,8 @@ func compareTokens(a, b graph.Value) bool {
 
 func (qs *QuadStore) FixedIterator() graph.FixedIterator {
 	return iterator.NewFixed(compareTokens)
+}
+
+func (qs *QuadStore) Type() string {
+	return QuadStoreType
 }

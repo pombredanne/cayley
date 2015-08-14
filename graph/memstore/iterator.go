@@ -15,6 +15,7 @@
 package memstore
 
 import (
+	"io"
 	"math"
 
 	"github.com/google/cayley/graph"
@@ -30,10 +31,7 @@ type Iterator struct {
 	iter   *b.Enumerator
 	data   string
 	result graph.Value
-}
-
-func cmp(a, b int64) int {
-	return int(a - b)
+	err    error
 }
 
 func NewIterator(tree *b.Tree, data string, qs *QuadStore) *Iterator {
@@ -104,7 +102,9 @@ func (it *Iterator) Clone() graph.Iterator {
 	return m
 }
 
-func (it *Iterator) Close() {}
+func (it *Iterator) Close() error {
+	return nil
+}
 
 func (it *Iterator) checkValid(index int64) bool {
 	return it.qs.log[index].DeletedBy == 0
@@ -118,6 +118,9 @@ func (it *Iterator) Next() bool {
 	}
 	result, _, err := it.iter.Next()
 	if err != nil {
+		if err != io.EOF {
+			it.err = err
+		}
 		return graph.NextLogOut(it, nil, false)
 	}
 	if !it.checkValid(result) {
@@ -127,8 +130,8 @@ func (it *Iterator) Next() bool {
 	return graph.NextLogOut(it, it.result, true)
 }
 
-func (it *Iterator) ResultTree() *graph.ResultTree {
-	return graph.NewResultTree(it.Result())
+func (it *Iterator) Err() error {
+	return it.err
 }
 
 func (it *Iterator) Result() graph.Value {
@@ -191,3 +194,5 @@ func (it *Iterator) Stats() graph.IteratorStats {
 		Size:         int64(it.tree.Len()),
 	}
 }
+
+var _ graph.Nexter = &Iterator{}

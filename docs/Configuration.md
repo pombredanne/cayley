@@ -22,7 +22,7 @@ All command line flags take precedence over the configuration file.
   Determines the type of the underlying database. Options include:
 
   * `mem`: An in-memory store, based on an initial N-Quads file. Loses all changes when the process exits.
-  * `leveldb`: A persistent on-disk store backed by [LevelDB](http://code.google.com/p/leveldb/).
+  * `leveldb`: A persistent on-disk store backed by [LevelDB](https://github.com/google/leveldb).
   * `bolt`: Stores the graph data on-disk in a [Bolt](http://github.com/boltdb/bolt) file. Uses more disk space and memory than LevelDB for smaller stores, but is often faster to write to and comparable for large ones, with faster average query times.
   * `mongo`: Stores the graph data and indices in a [MongoDB](http://mongodb.org) instance. Slower, as it incurs network traffic, but multiple Cayley instances can disappear and reconnect at will, across a potentially horizontally-scaled store.
 
@@ -79,7 +79,7 @@ All command line flags take precedence over the configuration file.
   * Type: Integer or String
   * Default: 30
 
-The maximum length of time the Javascript runtime should run until cancelling the query and returning a 408 Timeout. When timeout is an integer is is interpretted as seconds, when it is a string it is [parsed](http://golang.org/pkg/time/#ParseDuration) as a Go time.Duration. A negative duration means no limit.
+The maximum length of time the Javascript runtime should run until cancelling the query and returning a 408 Timeout. When timeout is an integer is is interpreted as seconds, when it is a string it is [parsed](http://golang.org/pkg/time/#ParseDuration) as a Go time.Duration. A negative duration means no limit.
 
 ## Per-Database Options
 
@@ -122,4 +122,24 @@ Optionally disable syncing to disk per transaction. Nosync being true means much
   * Type: String
   * Default: "cayley"
 
-The name of the database within MongoDB to connect to. Manages its own collections and indicies therein.
+The name of the database within MongoDB to connect to. Manages its own collections and indices therein.
+
+## Per-Replication Options
+
+The `replication_options` object in the main configuration file contains any of these following options that change the behavior of the replication manager.
+
+### All
+
+#### **`ignore_missing`**
+
+  * Type: Boolean
+  * Default: false
+
+Optionally ignore missing quad on delete.
+
+#### **`ignore_duplicate`**
+
+  * Type: Boolean
+  * Default: false
+
+Optionally ignore duplicated quad on add.

@@ -12,34 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package graph_test
+package iterator
 
 import (
+	"errors"
 	"testing"
 
-	. "github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/quad"
 )
 
-func TestSingleIterator(t *testing.T) {
-	all := iterator.NewInt64(1, 3)
-	result := StringResultTreeEvaluator(all)
-	expected := "(1)\n(2)\n(3)\n"
-	if expected != result {
-		t.Errorf("Expected %q got %q", expected, result)
+func TestHasAIteratorErr(t *testing.T) {
+	wantErr := errors.New("unique")
+	errIt := newTestIterator(false, wantErr)
+
+	// TODO(andrew-d): pass a non-nil quadstore
+	hasa := NewHasA(nil, errIt, quad.Subject)
+
+	if hasa.Next() != false {
+		t.Errorf("HasA iterator did not pass through initial 'false'")
 	}
-}
-
-func TestAndIterator(t *testing.T) {
-	all1 := iterator.NewInt64(1, 3)
-	all2 := iterator.NewInt64(3, 5)
-	and := iterator.NewAnd()
-	and.AddSubIterator(all1)
-	and.AddSubIterator(all2)
-
-	result := StringResultTreeEvaluator(and)
-	expected := "(3 (3) (3))\n"
-	if expected != result {
-		t.Errorf("Expected %q got %q", expected, result)
+	if hasa.Err() != wantErr {
+		t.Errorf("HasA iterator did not pass through underlying Err")
 	}
 }

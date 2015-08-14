@@ -26,12 +26,44 @@ func init() {
 }
 
 type Single struct {
-	currentID graph.PrimaryKey
-	qs        graph.QuadStore
+	currentID  graph.PrimaryKey
+	qs         graph.QuadStore
+	ignoreOpts graph.IgnoreOpts
 }
 
 func NewSingleReplication(qs graph.QuadStore, opts graph.Options) (graph.QuadWriter, error) {
-	return &Single{currentID: qs.Horizon(), qs: qs}, nil
+	var (
+		ignoreMissing   bool
+		ignoreDuplicate bool
+		err             error
+	)
+
+	if *graph.IgnoreMissing {
+		ignoreMissing = true
+	} else {
+		ignoreMissing, _, err = opts.BoolKey("ignore_missing")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if *graph.IgnoreDup {
+		ignoreDuplicate = true
+	} else {
+		ignoreDuplicate, _, err = opts.BoolKey("ignore_duplicate")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &Single{
+		currentID: qs.Horizon(),
+		qs:        qs,
+		ignoreOpts: graph.IgnoreOpts{
+			IgnoreDup:     ignoreDuplicate,
+			IgnoreMissing: ignoreMissing,
+		},
+	}, nil
 }
 
 func (s *Single) AddQuad(q quad.Quad) error {
@@ -42,7 +74,7 @@ func (s *Single) AddQuad(q quad.Quad) error {
 		Action:    graph.Add,
 		Timestamp: time.Now(),
 	}
-	return s.qs.ApplyDeltas(deltas)
+	return s.qs.ApplyDeltas(deltas, s.ignoreOpts)
 }
 
 func (s *Single) AddQuadSet(set []quad.Quad) error {
@@ -55,8 +87,8 @@ func (s *Single) AddQuadSet(set []quad.Quad) error {
 			Timestamp: time.Now(),
 		}
 	}
-	s.qs.ApplyDeltas(deltas)
-	return nil
+
+	return s.qs.ApplyDeltas(deltas, s.ignoreOpts)
 }
 
 func (s *Single) RemoveQuad(q quad.Quad) error {
@@ -67,10 +99,19 @@ func (s *Single) RemoveQuad(q quad.Quad) error {
 		Action:    graph.Delete,
 		Timestamp: time.Now(),
 	}
-	return s.qs.ApplyDeltas(deltas)
+	return s.qs.ApplyDeltas(deltas, s.ignoreOpts)
 }
 
 func (s *Single) Close() error {
 	// Nothing to clean up locally.
 	return nil
+}
+
+func (s *Single) ApplyTransaction(t *graph.Transaction) error {
+	ts := time.Now()
+	for i := 0; i < len(t.Deltas); i++ {
+		t.Deltas[i].ID = s.currentID.Next()
+		t.Deltas[i].Timestamp = ts
+	}
+	return s.qs.ApplyDeltas(t.Deltas, s.ignoreOpts)
 }

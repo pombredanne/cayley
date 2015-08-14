@@ -23,8 +23,8 @@ package graph
 
 import (
 	"errors"
+	"fmt"
 
-	"github.com/barakmich/glog"
 	"github.com/google/cayley/quad"
 )
 
@@ -44,7 +44,7 @@ type Value interface{}
 type QuadStore interface {
 	// The only way in is through building a transaction, which
 	// is done by a replication strategy.
-	ApplyDeltas([]Delta) error
+	ApplyDeltas([]Delta, IgnoreOpts) error
 
 	// Given an opaque token, returns the quad for that token from the store.
 	Quad(Value) quad.Quad
@@ -95,44 +95,48 @@ type QuadStore interface {
 	//  qs.ValueOf(qs.Quad(id).Get(dir))
 	//
 	QuadDirection(id Value, d quad.Direction) Value
+
+	// Get the type of QuadStore
+	//TODO replace this using reflection
+	Type() string
 }
 
 type Options map[string]interface{}
 
-func (d Options) IntKey(key string) (int, bool) {
+func (d Options) IntKey(key string) (int, bool, error) {
 	if val, ok := d[key]; ok {
 		switch vv := val.(type) {
 		case float64:
-			return int(vv), true
+			return int(vv), true, nil
 		default:
-			glog.Fatalln("Invalid", key, "parameter type from config.")
+			return 0, false, fmt.Errorf("Invalid %s parameter type from config: %T", key, val)
 		}
 	}
-	return 0, false
+	return 0, false, nil
 }
 
-func (d Options) StringKey(key string) (string, bool) {
+func (d Options) StringKey(key string) (string, bool, error) {
 	if val, ok := d[key]; ok {
 		switch vv := val.(type) {
 		case string:
-			return vv, true
+			return vv, true, nil
 		default:
-			glog.Fatalln("Invalid", key, "parameter type from config.")
+			return "", false, fmt.Errorf("Invalid %s parameter type from config: %T", key, val)
 		}
 	}
-	return "", false
+	return "", false, nil
 }
 
-func (d Options) BoolKey(key string) (bool, bool) {
+func (d Options) BoolKey(key string) (bool, bool, error) {
 	if val, ok := d[key]; ok {
 		switch vv := val.(type) {
 		case bool:
-			return vv, true
+			return vv, true, nil
 		default:
-			glog.Fatalln("Invalid", key, "parameter type from config.")
+			return false, false, fmt.Errorf("Invalid %s parameter type from config: %T", key, val)
 		}
 	}
-	return false, false
+	return false, false, nil
 }
 
 var ErrCannotBulkLoad = errors.New("quadstore: cannot bulk load")
@@ -146,23 +150,26 @@ type BulkLoader interface {
 
 type NewStoreFunc func(string, Options) (QuadStore, error)
 type InitStoreFunc func(string, Options) error
+type NewStoreForRequestFunc func(QuadStore, Options) (QuadStore, error)
 
 type register struct {
-	newFunc      NewStoreFunc
-	initFunc     InitStoreFunc
-	isPersistent bool
+	newFunc           NewStoreFunc
+	newForRequestFunc NewStoreForRequestFunc
+	initFunc          InitStoreFunc
+	isPersistent      bool
 }
 
 var storeRegistry = make(map[string]register)
 
-func RegisterQuadStore(name string, persists bool, newFunc NewStoreFunc, initFunc InitStoreFunc) {
+func RegisterQuadStore(name string, persists bool, newFunc NewStoreFunc, initFunc InitStoreFunc, newForRequestFunc NewStoreForRequestFunc) {
 	if _, found := storeRegistry[name]; found {
 		panic("already registered QuadStore " + name)
 	}
 	storeRegistry[name] = register{
-		newFunc:      newFunc,
-		initFunc:     initFunc,
-		isPersistent: persists,
+		newFunc:           newFunc,
+		initFunc:          initFunc,
+		newForRequestFunc: newForRequestFunc,
+		isPersistent:      persists,
 	}
 }
 
@@ -180,6 +187,14 @@ func InitQuadStore(name, dbpath string, opts Options) error {
 		return r.initFunc(dbpath, opts)
 	}
 	return errors.New("quadstore: name '" + name + "' is not registered")
+}
+
+func NewQuadStoreForRequest(qs QuadStore, opts Options) (QuadStore, error) {
+	r, registered := storeRegistry[qs.Type()]
+	if registered {
+		return r.newForRequestFunc(qs, opts)
+	}
+	return nil, errors.New("QuadStore does not support Per Request construction, check config")
 }
 
 func IsPersistent(name string) bool {

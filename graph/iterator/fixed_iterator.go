@@ -63,7 +63,9 @@ func (it *Fixed) Reset() {
 	it.lastIndex = 0
 }
 
-func (it *Fixed) Close() {}
+func (it *Fixed) Close() error {
+	return nil
+}
 
 func (it *Fixed) Tagger() *graph.Tagger {
 	return &it.tags
@@ -143,9 +145,8 @@ func (it *Fixed) Next() bool {
 	return graph.NextLogOut(it, out, true)
 }
 
-// DEPRECATED
-func (it *Fixed) ResultTree() *graph.ResultTree {
-	return graph.NewResultTree(it.Result())
+func (it *Fixed) Err() error {
+	return nil
 }
 
 func (it *Fixed) Result() graph.Value {
@@ -186,3 +187,5 @@ func (it *Fixed) Stats() graph.IteratorStats {
 		Size:         int64(len(it.values)),
 	}
 }
+
+var _ graph.Nexter = &Fixed{}

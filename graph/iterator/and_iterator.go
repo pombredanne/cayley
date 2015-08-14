@@ -30,13 +30,17 @@ type And struct {
 	checkList         []graph.Iterator
 	result            graph.Value
 	runstats          graph.IteratorStats
+	err               error
+	qs                graph.QuadStore
 }
 
-// Creates a new And iterator.
-func NewAnd() *And {
+// NewAnd creates an And iterator. `qs` is only required when needing a handle
+// for QuadStore-specific optimizations, otherwise nil is acceptable.
+func NewAnd(qs graph.QuadStore) *And {
 	return &And{
 		uid:               NextUID(),
 		internalIterators: make([]graph.Iterator, 0, 20),
+		qs:                qs,
 	}
 }
 
@@ -78,7 +82,7 @@ func (it *And) TagResults(dst map[string]graph.Value) {
 }
 
 func (it *And) Clone() graph.Iterator {
-	and := NewAnd()
+	and := NewAnd(it.qs)
 	and.AddSubIterator(it.primaryIt.Clone())
 	and.tags.CopyFrom(it)
 	for _, sub := range it.internalIterators {
@@ -96,16 +100,6 @@ func (it *And) SubIterators() []graph.Iterator {
 	iters[0] = it.primaryIt
 	copy(iters[1:], it.internalIterators)
 	return iters
-}
-
-// DEPRECATED Returns the ResultTree for this iterator, recurses to it's subiterators.
-func (it *And) ResultTree() *graph.ResultTree {
-	tree := graph.NewResultTree(it.Result())
-	tree.AddSubtree(it.primaryIt.ResultTree())
-	for _, sub := range it.internalIterators {
-		tree.AddSubtree(sub.ResultTree())
-	}
-	return tree
 }
 
 func (it *And) Describe() graph.Description {
@@ -153,7 +147,12 @@ func (it *And) Next() bool {
 			return graph.NextLogOut(it, curr, true)
 		}
 	}
+	it.err = it.primaryIt.Err()
 	return graph.NextLogOut(it, nil, false)
+}
+
+func (it *And) Err() error {
+	return it.err
 }
 
 func (it *And) Result() graph.Value {
@@ -182,9 +181,26 @@ func (it *And) checkContainsList(val graph.Value, lastResult graph.Value) bool {
 	for i, c := range it.checkList {
 		ok = c.Contains(val)
 		if !ok {
+			it.err = c.Err()
+			if it.err != nil {
+				return false
+			}
+
 			if lastResult != nil {
 				for j := 0; j < i; j++ {
+					// One of the iterators has determined that this value doesn't
+					// match. However, the iterators that came before in the list
+					// may have returned "ok" to Contains().  We need to set all
+					// the tags back to what the previous result was -- effectively
+					// seeking back exactly one -- so we check all the prior iterators
+					// with the (already verified) result and throw away the result,
+					// which will be 'true'
 					it.checkList[j].Contains(lastResult)
+
+					it.err = it.checkList[j].Err()
+					if it.err != nil {
+						return false
+					}
 				}
 			}
 			break
@@ -241,9 +257,18 @@ func (it *And) NextPath() bool {
 	if it.primaryIt.NextPath() {
 		return true
 	}
+	it.err = it.primaryIt.Err()
+	if it.err != nil {
+		return false
+	}
 	for _, sub := range it.internalIterators {
 		if sub.NextPath() {
 			return true
+		}
+
+		it.err = sub.Err()
+		if it.err != nil {
+			return false
 		}
 	}
 	return false
@@ -254,14 +279,23 @@ func (it *And) cleanUp() {}
 
 // Close this iterator, and, by extension, close the subiterators.
 // Close should be idempotent, and it follows that if it's subiterators
-// follow this contract, the And follows the contract.
-func (it *And) Close() {
+// follow this contract, the And follows the contract.  It closes all
+// subiterators it can, but returns the first error it encounters.
+func (it *And) Close() error {
 	it.cleanUp()
-	it.primaryIt.Close()
+
+	err := it.primaryIt.Close()
 	for _, sub := range it.internalIterators {
-		sub.Close()
+		_err := sub.Close()
+		if _err != nil && err == nil {
+			err = _err
+		}
 	}
+
+	return err
 }
 
 // Register this as an "and" iterator.
 func (it *And) Type() graph.Type { return graph.And }
+
+var _ graph.Nexter = &And{}

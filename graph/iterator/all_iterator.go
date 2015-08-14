@@ -55,7 +55,9 @@ func (it *Int64) Reset() {
 	it.at = it.min
 }
 
-func (it *Int64) Close() {}
+func (it *Int64) Close() error {
+	return nil
+}
 
 func (it *Int64) Clone() graph.Iterator {
 	out := NewInt64(it.min, it.max)
@@ -103,9 +105,8 @@ func (it *Int64) Next() bool {
 	return graph.NextLogOut(it, val, true)
 }
 
-// DEPRECATED
-func (it *Int64) ResultTree() *graph.ResultTree {
-	return graph.NewResultTree(it.Result())
+func (it *Int64) Err() error {
+	return nil
 }
 
 func (it *Int64) Result() graph.Value {
@@ -160,3 +161,5 @@ func (it *Int64) Stats() graph.IteratorStats {
 		Contains:     it.runstats.Contains,
 	}
 }
+
+var _ graph.Nexter = &Int64{}

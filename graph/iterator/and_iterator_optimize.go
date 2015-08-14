@@ -78,7 +78,7 @@ func (it *And) Optimize() (graph.Iterator, bool) {
 
 	// The easiest thing to do at this point is merely to create a new And iterator
 	// and replace ourselves with our (reordered, optimized) clone.
-	newAnd := NewAnd()
+	newAnd := NewAnd(it.qs)
 
 	// Add the subiterators in order.
 	for _, sub := range its {
@@ -95,6 +95,18 @@ func (it *And) Optimize() (graph.Iterator, bool) {
 	// the new And (they were unchanged upon calling Optimize() on them, at the
 	// start).
 	it.cleanUp()
+
+	// Ask the graph.QuadStore if we can be replaced. Often times, this is a great
+	// optimization opportunity (there's a fixed iterator underneath us, for
+	// example).
+	if it.qs != nil {
+		newReplacement, hasOne := it.qs.OptimizeIterator(newAnd)
+		if hasOne {
+			newAnd.Close()
+			return newReplacement, true
+		}
+	}
+
 	return newAnd, true
 }
 
@@ -280,12 +292,15 @@ func hasAnyNullIterators(its []graph.Iterator) bool {
 // nothing, and graph.All which returns everything. Particularly, we want
 // to see if we're intersecting with a bunch of graph.All iterators, and,
 // if we are, then we have only one useful iterator.
+//
+// We already checked for hasAnyNullIteratators() -- so now we're considering
+// All iterators.
 func hasOneUsefulIterator(its []graph.Iterator) graph.Iterator {
 	usefulCount := 0
 	var usefulIt graph.Iterator
 	for _, it := range its {
 		switch it.Type() {
-		case graph.Null, graph.All:
+		case graph.All:
 			continue
 		case graph.Optional:
 			// Optional is weird -- it's not useful, but we can't optimize
@@ -300,6 +315,10 @@ func hasOneUsefulIterator(its []graph.Iterator) graph.Iterator {
 
 	if usefulCount == 1 {
 		return usefulIt
+	}
+	if usefulCount == 0 {
+		// It's full of All iterators. We can safely return one of them.
+		return its[0]
 	}
 	return nil
 }

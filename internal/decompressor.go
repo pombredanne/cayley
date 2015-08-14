@@ -12,40 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package keys
+package internal
 
 import (
-	"github.com/google/cayley/graph"
-	"strconv"
-	"sync"
+	"bufio"
+	"bytes"
+	"compress/bzip2"
+	"compress/gzip"
+	"io"
 )
 
-type Sequential struct {
-	nextID int64
-	mut    sync.Mutex
-}
+const (
+	gzipMagic  = "\x1f\x8b"
+	b2zipMagic = "BZh"
+)
 
-func NewSequentialKey(horizon int64) graph.PrimaryKey {
-	if horizon <= 0 {
-		horizon = 1
+// Decompressor detects the file type of an io.Reader between
+// bzip, gzip, or raw quad file.
+func Decompressor(r io.Reader) (io.Reader, error) {
+	br := bufio.NewReader(r)
+	buf, err := br.Peek(3)
+	if err != nil {
+		return nil, err
 	}
-	return &Sequential{nextID: horizon}
-}
-
-func (s *Sequential) Next() graph.PrimaryKey {
-	s.mut.Lock()
-	defer s.mut.Unlock()
-	s.nextID++
-	if s.nextID <= 0 {
-		s.nextID = 1
+	switch {
+	case bytes.Compare(buf[:2], []byte(gzipMagic)) == 0:
+		return gzip.NewReader(br)
+	case bytes.Compare(buf[:3], []byte(b2zipMagic)) == 0:
+		return bzip2.NewReader(br), nil
+	default:
+		return br, nil
 	}
-	return s
-}
-
-func (s *Sequential) Int() int64 {
-	return s.nextID
-}
-
-func (s *Sequential) String() string {
-	return strconv.FormatInt(s.nextID, 10)
 }

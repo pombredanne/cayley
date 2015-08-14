@@ -15,6 +15,7 @@
 package memstore
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -23,14 +24,19 @@ import (
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
 	"github.com/google/cayley/graph/memstore/b"
-	"github.com/google/cayley/keys"
 	"github.com/google/cayley/quad"
 )
 
+const QuadStoreType = "memstore"
+
 func init() {
-	graph.RegisterQuadStore("memstore", false, func(string, graph.Options) (graph.QuadStore, error) {
+	graph.RegisterQuadStore(QuadStoreType, false, func(string, graph.Options) (graph.QuadStore, error) {
 		return newQuadStore(), nil
-	}, nil)
+	}, nil, nil)
+}
+
+func cmp(a, b int64) int {
+	return int(a - b)
 }
 
 type QuadDirectionIndex struct {
@@ -99,13 +105,22 @@ func newQuadStore() *QuadStore {
 	}
 }
 
-func (qs *QuadStore) ApplyDeltas(deltas []graph.Delta) error {
+func (qs *QuadStore) ApplyDeltas(deltas []graph.Delta, ignoreOpts graph.IgnoreOpts) error {
 	for _, d := range deltas {
 		var err error
-		if d.Action == graph.Add {
+		switch d.Action {
+		case graph.Add:
 			err = qs.AddDelta(d)
-		} else {
+			if err != nil && ignoreOpts.IgnoreDup {
+				err = nil
+			}
+		case graph.Delete:
 			err = qs.RemoveDelta(d)
+			if err != nil && ignoreOpts.IgnoreMissing {
+				err = nil
+			}
+		default:
+			err = errors.New("memstore: invalid action")
 		}
 		if err != nil {
 			return err
@@ -172,13 +187,7 @@ func (qs *QuadStore) AddDelta(d graph.Delta) error {
 			qs.revIDMap[qs.nextID] = sid
 			qs.nextID++
 		}
-	}
-
-	for dir := quad.Subject; dir <= quad.Label; dir++ {
-		if dir == quad.Label && d.Quad.Get(dir) == "" {
-			continue
-		}
-		id := qs.idMap[d.Quad.Get(dir)]
+		id := qs.idMap[sid]
 		tree := qs.index.Tree(dir, id)
 		tree.Set(qid, struct{}{})
 	}
@@ -219,7 +228,7 @@ func (qs *QuadStore) QuadIterator(d quad.Direction, value graph.Value) graph.Ite
 }
 
 func (qs *QuadStore) Horizon() graph.PrimaryKey {
-	return keys.NewSequentialKey(qs.log[len(qs.log)-1].ID)
+	return graph.NewSequentialKey(qs.log[len(qs.log)-1].ID)
 }
 
 func (qs *QuadStore) Size() int64 {
@@ -261,3 +270,7 @@ func (qs *QuadStore) NodesAllIterator() graph.Iterator {
 }
 
 func (qs *QuadStore) Close() {}
+
+func (qs *QuadStore) Type() string {
+	return QuadStoreType
+}

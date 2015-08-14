@@ -30,7 +30,21 @@ type Tagger struct {
 	fixedTags map[string]Value
 }
 
-// Adds a tag to the iterator.
+// TODO(barakmich): Linkage is general enough that there are places we take
+//the combined arguments `quad.Direction, graph.Value` that it may be worth
+//converting these into Linkages. If nothing else, future indexed iterators may
+//benefit from the shared representation
+
+// Linkage is a union type representing a set of values established for a given
+// quad direction.
+type Linkage struct {
+	Dir   quad.Direction
+	Value Value
+}
+
+// TODO(barakmich): Helper functions as needed, eg, ValuesForDirection(quad.Direction) []Value
+
+// Add a tag to the iterator.
 func (t *Tagger) Add(tag string) {
 	t.tags = append(t.tags, tag)
 }
@@ -42,12 +56,12 @@ func (t *Tagger) AddFixed(tag string, value Value) {
 	t.fixedTags[tag] = value
 }
 
-// Returns the tags. The returned value must not be mutated.
+// Tags returns the tags held in the tagger. The returned value must not be mutated.
 func (t *Tagger) Tags() []string {
 	return t.tags
 }
 
-// Returns the fixed tags. The returned value must not be mutated.
+// Fixed returns the fixed tags held in the tagger. The returned value must not be mutated.
 func (t *Tagger) Fixed() map[string]Value {
 	return t.fixedTags
 }
@@ -74,9 +88,6 @@ type Iterator interface {
 	// Returns the current result.
 	Result() Value
 
-	// DEPRECATED -- Fills a ResultTree struct with Result().
-	ResultTree() *ResultTree
-
 	// These methods are the heart and soul of the iterator, as they constitute
 	// the iteration interface.
 	//
@@ -99,6 +110,9 @@ type Iterator interface {
 
 	// Contains returns whether the value is within the set held by the iterator.
 	Contains(Value) bool
+
+	// Err returns any error that was encountered by the Iterator.
+	Err() error
 
 	// Start iteration from the beginning
 	Reset()
@@ -136,7 +150,7 @@ type Iterator interface {
 	Describe() Description
 
 	// Close the iterator and do internal cleanup.
-	Close()
+	Close() error
 
 	// UID returns the unique identifier of the iterator.
 	UID() uint64
@@ -153,9 +167,14 @@ type Description struct {
 	Iterators []Description  `json:",omitempty"`
 }
 
+// ApplyMorphism is a curried function that can generates a new iterator based on some prior iterator.
+type ApplyMorphism func(QuadStore, Iterator) Iterator
+
 type Nexter interface {
 	// Next advances the iterator to the next value, which will then be available through
-	// the Result method. It returns false if no further advancement is possible.
+	// the Result method. It returns false if no further advancement is possible, or if an
+	// error was encountered during iteration.  Err should be consulted to distinguish
+	// between the two cases.
 	Next() bool
 
 	Iterator
@@ -206,6 +225,7 @@ type IteratorStats struct {
 // Type enumerates the set of Iterator types.
 type Type int
 
+// These are the iterator types, defined as constants
 const (
 	Invalid Type = iota
 	All
@@ -219,6 +239,7 @@ const (
 	Not
 	Optional
 	Materialize
+	Unique
 )
 
 var (
@@ -240,6 +261,7 @@ var (
 		"not",
 		"optional",
 		"materialize",
+		"unique",
 	}
 )
 
@@ -306,6 +328,7 @@ func DumpStats(it Iterator) StatsContainer {
 
 // Utility logging functions for when an iterator gets called Next upon, or Contains upon, as
 // well as what they return. Highly useful for tracing the execution path of a query.
+
 func ContainsLogIn(it Iterator, val Value) {
 	if glog.V(4) {
 		glog.V(4).Infof("%s %d CHECK CONTAINS %d", strings.ToUpper(it.Type().String()), it.UID(), val)

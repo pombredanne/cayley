@@ -119,8 +119,8 @@ func (it *AllIterator) Next() bool {
 	return true
 }
 
-func (it *AllIterator) ResultTree() *graph.ResultTree {
-	return graph.NewResultTree(it.Result())
+func (it *AllIterator) Err() error {
+	return it.iter.Error()
 }
 
 func (it *AllIterator) Result() graph.Value {
@@ -141,11 +141,12 @@ func (it *AllIterator) Contains(v graph.Value) bool {
 	return true
 }
 
-func (it *AllIterator) Close() {
+func (it *AllIterator) Close() error {
 	if it.open {
 		it.iter.Release()
 		it.open = false
 	}
+	return nil
 }
 
 func (it *AllIterator) Size() (int64, bool) {
@@ -183,3 +184,5 @@ func (it *AllIterator) Stats() graph.IteratorStats {
 		Size:         s,
 	}
 }
+
+var _ graph.Nexter = &AllIterator{}
