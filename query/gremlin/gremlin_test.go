@@ -186,6 +186,13 @@ var testQueries = []struct {
 		`,
 		expect: []string{"charlie"},
 	},
+	{
+		message: "test Or()",
+		query: `
+			g.V("bob").Out("follows").Or(g.V().Has("status", "cool_person")).All()
+		`,
+		expect: []string{"fred", "bob", "greg", "dani"},
+	},
 
 	// Gremlin Has tests.
 	{
@@ -262,14 +269,14 @@ var testQueries = []struct {
 		query: `
 		  g.V().InPredicates().All()
 		`,
-		expect: []string{"follows", "status"},
+		expect: []string{"are", "follows", "status"},
 	},
 	{
 		message: "list all out predicates",
 		query: `
 		  g.V().OutPredicates().All()
 		`,
-		expect: []string{"follows", "status"},
+		expect: []string{"are", "follows", "status"},
 	},
 }
 
@@ -322,6 +329,7 @@ func TestGremlin(t *testing.T) {
 		got := runQueryGetTag(simpleGraph, test.query, test.tag)
 		sort.Strings(got)
 		sort.Strings(test.expect)
+		t.Log("testing", test.message)
 		if !reflect.DeepEqual(got, test.expect) {
 			t.Errorf("Failed to %s, got: %v expected: %v", test.message, got, test.expect)
 		}

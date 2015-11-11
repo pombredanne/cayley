@@ -15,63 +15,88 @@
 package path
 
 import (
+	"fmt"
+
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
 	"github.com/google/cayley/quad"
 )
 
+// join puts two iterators together by intersecting their result sets with an AND
+// Since we're using an and iterator, it's a good idea to put the smallest result
+// set first so that Next() produces fewer values to check Contains().
+func join(qs graph.QuadStore, itL, itR graph.Iterator) graph.Iterator {
+	and := iterator.NewAnd(qs)
+	and.AddSubIterator(itL)
+	and.AddSubIterator(itR)
+
+	return and
+}
+
+// isMorphism represents all nodes passed in-- if there are none, this function
+// acts as a passthrough for the previous iterator.
 func isMorphism(nodes ...string) morphism {
 	return morphism{
 		Name:     "is",
-		Reversal: func() morphism { return isMorphism(nodes...) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
-			var sub graph.Iterator
+		Reversal: func(ctx *context) (morphism, *context) { return isMorphism(nodes...), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
 			if len(nodes) == 0 {
-				sub = qs.NodesAllIterator()
-			} else {
-				fixed := qs.FixedIterator()
-				for _, n := range nodes {
-					fixed.Add(qs.ValueOf(n))
-				}
-				sub = fixed
+				// Acting as a passthrough here is equivalent to
+				// building a NodesAllIterator to Next() or Contains()
+				// from here as in previous versions.
+				return in, ctx
 			}
-			and := iterator.NewAnd(qs)
-			and.AddSubIterator(sub)
-			and.AddSubIterator(it)
-			return and
+
+			isNodes := qs.FixedIterator()
+			for _, n := range nodes {
+				isNodes.Add(qs.ValueOf(n))
+			}
+
+			// Anything with fixedIterators will usually have a much
+			// smaller result set, so join isNodes first here.
+			return join(qs, isNodes, in), ctx
 		},
 	}
 }
 
+// hasMorphism is the set of nodes that is reachable via either a *Path, a
+// single node.(string) or a list of nodes.([]string).
 func hasMorphism(via interface{}, nodes ...string) morphism {
 	return morphism{
 		Name:     "has",
-		Reversal: func() morphism { return hasMorphism(via, nodes...) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
-			var sub graph.Iterator
-			if len(nodes) == 0 {
-				sub = qs.NodesAllIterator()
-			} else {
+		Reversal: func(ctx *context) (morphism, *context) { return hasMorphism(via, nodes...), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			viaIter := buildViaPath(qs, via).
+				BuildIterator()
+			ends := func() graph.Iterator {
+				if len(nodes) == 0 {
+					return qs.NodesAllIterator()
+				}
+
 				fixed := qs.FixedIterator()
 				for _, n := range nodes {
 					fixed.Add(qs.ValueOf(n))
 				}
-				sub = fixed
+				return fixed
+			}()
+
+			trail := iterator.NewLinksTo(qs, viaIter, quad.Predicate)
+			dest := iterator.NewLinksTo(qs, ends, quad.Object)
+
+			// If we were given nodes, intersecting with them first will
+			// be extremely cheap-- otherwise, it will be the most expensive
+			// (requiring iteration over all nodes). We have enough info to
+			// make this optimization now since intersections are commutative
+			if len(nodes) == 0 { // Where dest involves an All iterator.
+				route := join(qs, trail, dest)
+				has := iterator.NewHasA(qs, route, quad.Subject)
+				return join(qs, in, has), ctx
 			}
-			var viaPath *Path
-			if via != nil {
-				viaPath = buildViaPath(qs, via)
-			} else {
-				viaPath = buildViaPath(qs)
-			}
-			subAnd := iterator.NewAnd(qs)
-			subAnd.AddSubIterator(iterator.NewLinksTo(qs, sub, quad.Object))
-			subAnd.AddSubIterator(iterator.NewLinksTo(qs, viaPath.BuildIterator(), quad.Predicate))
-			hasa := iterator.NewHasA(qs, subAnd, quad.Subject)
-			and := iterator.NewAnd(qs)
-			and.AddSubIterator(it)
-			and.AddSubIterator(hasa)
-			return and
+
+			// This looks backwards. That's OK-- see the note above.
+			route := join(qs, dest, trail)
+			has := iterator.NewHasA(qs, route, quad.Subject)
+			return join(qs, has, in), ctx
 		},
 	}
 }
@@ -79,76 +104,117 @@ func hasMorphism(via interface{}, nodes ...string) morphism {
 func tagMorphism(tags ...string) morphism {
 	return morphism{
 		Name:     "tag",
-		Reversal: func() morphism { return tagMorphism(tags...) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
+		Reversal: func(ctx *context) (morphism, *context) { return tagMorphism(tags...), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
 			for _, t := range tags {
-				it.Tagger().Add(t)
+				in.Tagger().Add(t)
 			}
-			return it
+			return in, ctx
 		},
 		tags: tags,
 	}
 }
 
-func outMorphism(via ...interface{}) morphism {
+// outMorphism iterates forward one RDF triple or via an entire path.
+func outMorphism(tags []string, via ...interface{}) morphism {
 	return morphism{
 		Name:     "out",
-		Reversal: func() morphism { return inMorphism(via...) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
+		Reversal: func(ctx *context) (morphism, *context) { return inMorphism(tags, via...), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
 			path := buildViaPath(qs, via...)
-			return inOutIterator(path, it, false)
+			return inOutIterator(path, in, false, tags), ctx
 		},
 	}
 }
 
-func inMorphism(via ...interface{}) morphism {
+// inMorphism iterates backwards one RDF triple or via an entire path.
+func inMorphism(tags []string, via ...interface{}) morphism {
 	return morphism{
 		Name:     "in",
-		Reversal: func() morphism { return outMorphism(via...) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
+		Reversal: func(ctx *context) (morphism, *context) { return outMorphism(tags, via...), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
 			path := buildViaPath(qs, via...)
-			return inOutIterator(path, it, true)
+			return inOutIterator(path, in, true, tags), ctx
 		},
 	}
 }
 
+func bothMorphism(tags []string, via ...interface{}) morphism {
+	return morphism{
+		Name:     "in",
+		Reversal: func(ctx *context) (morphism, *context) { return bothMorphism(tags, via...), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			path := buildViaPath(qs, via...)
+			inSide := inOutIterator(path, in, true, tags)
+			outSide := inOutIterator(path, in.Clone(), false, tags)
+			or := iterator.NewOr()
+			or.AddSubIterator(inSide)
+			or.AddSubIterator(outSide)
+			return or, ctx
+		},
+	}
+}
+
+// predicatesMorphism iterates to the uniqified set of predicates from
+// the given set of nodes in the path.
+func predicatesMorphism(isIn bool) morphism {
+	m := morphism{
+		Name: "out_predicates",
+		Reversal: func(ctx *context) (morphism, *context) {
+			panic("not implemented: need a function from predicates to their associated edges")
+		},
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			dir := quad.Subject
+			if isIn {
+				dir = quad.Object
+			}
+			lto := iterator.NewLinksTo(qs, in, dir)
+			hasa := iterator.NewHasA(qs, lto, quad.Predicate)
+			return iterator.NewUnique(hasa), ctx
+		},
+	}
+	if isIn {
+		m.Name = "in_predicates"
+	}
+	return m
+}
+
+// iteratorMorphism simply tacks the input iterator onto the chain.
 func iteratorMorphism(it graph.Iterator) morphism {
 	return morphism{
 		Name:     "iterator",
-		Reversal: func() morphism { return iteratorMorphism(it) },
-		Apply: func(qs graph.QuadStore, subIt graph.Iterator) graph.Iterator {
-			and := iterator.NewAnd(qs)
-			and.AddSubIterator(it)
-			and.AddSubIterator(subIt)
-			return and
+		Reversal: func(ctx *context) (morphism, *context) { return iteratorMorphism(it), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			return join(qs, it, in), ctx
 		},
 	}
 }
 
+// andMorphism sticks a path onto the current iterator chain.
 func andMorphism(p *Path) morphism {
 	return morphism{
 		Name:     "and",
-		Reversal: func() morphism { return andMorphism(p) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
-			subIt := p.BuildIteratorOn(qs)
-			and := iterator.NewAnd(qs)
-			and.AddSubIterator(it)
-			and.AddSubIterator(subIt)
-			return and
+		Reversal: func(ctx *context) (morphism, *context) { return andMorphism(p), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			itR := p.BuildIteratorOn(qs)
+
+			return join(qs, in, itR), ctx
 		},
 	}
 }
 
+// orMorphism is the union, vice intersection, of a path and the current iterator.
 func orMorphism(p *Path) morphism {
 	return morphism{
 		Name:     "or",
-		Reversal: func() morphism { return orMorphism(p) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
-			subIt := p.BuildIteratorOn(qs)
-			and := iterator.NewOr()
-			and.AddSubIterator(it)
-			and.AddSubIterator(subIt)
-			return and
+		Reversal: func(ctx *context) (morphism, *context) { return orMorphism(p), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			itR := p.BuildIteratorOn(qs)
+
+			or := iterator.NewOr()
+			or.AddSubIterator(in)
+			or.AddSubIterator(itR)
+			return or, ctx
 		},
 	}
 }
@@ -156,24 +222,24 @@ func orMorphism(p *Path) morphism {
 func followMorphism(p *Path) morphism {
 	return morphism{
 		Name:     "follow",
-		Reversal: func() morphism { return followMorphism(p.Reverse()) },
-		Apply: func(qs graph.QuadStore, base graph.Iterator) graph.Iterator {
-			return p.Morphism()(qs, base)
+		Reversal: func(ctx *context) (morphism, *context) { return followMorphism(p.Reverse()), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			return p.Morphism()(qs, in), ctx
 		},
 	}
 }
 
+// exceptMorphism removes all results on p.(*Path) from the current iterators.
 func exceptMorphism(p *Path) morphism {
 	return morphism{
 		Name:     "except",
-		Reversal: func() morphism { return exceptMorphism(p) },
-		Apply: func(qs graph.QuadStore, base graph.Iterator) graph.Iterator {
+		Reversal: func(ctx *context) (morphism, *context) { return exceptMorphism(p), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
 			subIt := p.BuildIteratorOn(qs)
-			notIt := iterator.NewNot(subIt, qs.NodesAllIterator())
-			and := iterator.NewAnd(qs)
-			and.AddSubIterator(base)
-			and.AddSubIterator(notIt)
-			return and
+			allNodes := qs.NodesAllIterator()
+			notIn := iterator.NewNot(subIt, allNodes)
+
+			return join(qs, in, notIn), ctx
 		},
 	}
 }
@@ -181,9 +247,9 @@ func exceptMorphism(p *Path) morphism {
 func saveMorphism(via interface{}, tag string) morphism {
 	return morphism{
 		Name:     "save",
-		Reversal: func() morphism { return saveMorphism(via, tag) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
-			return buildSave(qs, via, tag, it, false)
+		Reversal: func(ctx *context) (morphism, *context) { return saveMorphism(via, tag), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			return buildSave(qs, via, tag, in, false), ctx
 		},
 		tags: []string{tag},
 	}
@@ -192,48 +258,55 @@ func saveMorphism(via interface{}, tag string) morphism {
 func saveReverseMorphism(via interface{}, tag string) morphism {
 	return morphism{
 		Name:     "saver",
-		Reversal: func() morphism { return saveReverseMorphism(via, tag) },
-		Apply: func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
-			return buildSave(qs, via, tag, it, true)
+		Reversal: func(ctx *context) (morphism, *context) { return saveReverseMorphism(via, tag), ctx },
+		Apply: func(qs graph.QuadStore, in graph.Iterator, ctx *context) (graph.Iterator, *context) {
+			return buildSave(qs, via, tag, in, true), ctx
 		},
 		tags: []string{tag},
 	}
 }
 
-func buildSave(qs graph.QuadStore, via interface{}, tag string, it graph.Iterator, reverse bool) graph.Iterator {
-	all := qs.NodesAllIterator()
-	all.Tagger().Add(tag)
-	node, allDir := quad.Subject, quad.Object
-	var viaPath *Path
-	if via != nil {
-		viaPath = buildViaPath(qs, via)
-	} else {
-		viaPath = buildViaPath(qs)
-	}
+func buildSave(
+	qs graph.QuadStore, via interface{},
+	tag string, from graph.Iterator, reverse bool,
+) graph.Iterator {
+
+	allNodes := qs.NodesAllIterator()
+	allNodes.Tagger().Add(tag)
+
+	start, goal := quad.Subject, quad.Object
 	if reverse {
-		node, allDir = allDir, node
+		start, goal = goal, start
 	}
-	lto := iterator.NewLinksTo(qs, all, allDir)
-	subAnd := iterator.NewAnd(qs)
-	subAnd.AddSubIterator(iterator.NewLinksTo(qs, viaPath.BuildIterator(), quad.Predicate))
-	subAnd.AddSubIterator(lto)
-	hasa := iterator.NewHasA(qs, subAnd, node)
-	and := iterator.NewAnd(qs)
-	and.AddSubIterator(hasa)
-	and.AddSubIterator(it)
-	return and
+	viaIter := buildViaPath(qs, via).
+		BuildIterator()
+
+	dest := iterator.NewLinksTo(qs, allNodes, goal)
+	trail := iterator.NewLinksTo(qs, viaIter, quad.Predicate)
+
+	route := join(qs, trail, dest)
+	save := iterator.NewHasA(qs, route, start)
+
+	return join(qs, from, save)
 }
 
-func inOutIterator(viaPath *Path, it graph.Iterator, reverse bool) graph.Iterator {
-	in, out := quad.Subject, quad.Object
-	if reverse {
-		in, out = out, in
+func inOutIterator(viaPath *Path, from graph.Iterator, inIterator bool, tags []string) graph.Iterator {
+	start, goal := quad.Subject, quad.Object
+	if inIterator {
+		start, goal = goal, start
 	}
-	lto := iterator.NewLinksTo(viaPath.qs, it, in)
-	and := iterator.NewAnd(viaPath.qs)
-	and.AddSubIterator(iterator.NewLinksTo(viaPath.qs, viaPath.BuildIterator(), quad.Predicate))
-	and.AddSubIterator(lto)
-	return iterator.NewHasA(viaPath.qs, and, out)
+
+	viaIter := viaPath.BuildIterator()
+	for _, tag := range tags {
+		viaIter.Tagger().Add(tag)
+	}
+
+	source := iterator.NewLinksTo(viaPath.qs, from, start)
+	trail := iterator.NewLinksTo(viaPath.qs, viaIter, quad.Predicate)
+
+	route := join(viaPath.qs, source, trail)
+
+	return iterator.NewHasA(viaPath.qs, route, goal)
 }
 
 func buildViaPath(qs graph.QuadStore, via ...interface{}) *Path {
@@ -242,12 +315,22 @@ func buildViaPath(qs graph.QuadStore, via ...interface{}) *Path {
 	} else if len(via) == 1 {
 		v := via[0]
 		switch p := v.(type) {
+		case nil:
+			return PathFromIterator(qs, qs.NodesAllIterator())
 		case *Path:
+			if p.qs != qs {
+				newp := &Path{
+					qs:          qs,
+					baseContext: p.baseContext,
+					stack:       p.stack[:],
+				}
+				return newp
+			}
 			return p
 		case string:
 			return StartPath(qs, p)
 		default:
-			panic("Invalid type passed to buildViaPath.")
+			panic(fmt.Sprint("Invalid type passed to buildViaPath. ", p))
 		}
 	}
 	var strings []string
