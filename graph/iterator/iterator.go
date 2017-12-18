@@ -19,7 +19,8 @@ package iterator
 import (
 	"sync/atomic"
 
-	"github.com/google/cayley/graph"
+	"fmt"
+	"github.com/cayleygraph/cayley/graph"
 )
 
 var nextIteratorID uint64
@@ -31,6 +32,11 @@ func init() {
 func NextUID() uint64 {
 	return atomic.AddUint64(&nextIteratorID, 1) - 1
 }
+
+var (
+	_ graph.Iterator = &Null{}
+	_ graph.Iterator = &Error{}
+)
 
 // Here we define the simplest iterator -- the Null iterator. It contains nothing.
 // It is the empty set. Often times, queries that contain one of these match nothing,
@@ -55,13 +61,7 @@ func (it *Null) Tagger() *graph.Tagger {
 
 // Fill the map based on the tags assigned to this iterator.
 func (it *Null) TagResults(dst map[string]graph.Value) {
-	for _, tag := range it.tags.Tags() {
-		dst[tag] = it.Result()
-	}
-
-	for tag, value := range it.tags.Fixed() {
-		dst[tag] = value
-	}
+	it.tags.TagResult(dst, it.Result())
 }
 
 func (it *Null) Contains(graph.Value) bool {
@@ -77,11 +77,8 @@ func (it *Null) Type() graph.Type { return graph.Null }
 // Null has nothing it needs to do.
 func (it *Null) Optimize() (graph.Iterator, bool) { return it, false }
 
-func (it *Null) Describe() graph.Description {
-	return graph.Description{
-		UID:  it.UID(),
-		Type: it.Type(),
-	}
+func (it *Null) String() string {
+	return "Null"
 }
 
 func (it *Null) Next() bool {
@@ -119,4 +116,74 @@ func (it *Null) Stats() graph.IteratorStats {
 	return graph.IteratorStats{}
 }
 
-var _ graph.Nexter = &Null{}
+// Error iterator always returns a single error with no other results.
+type Error struct {
+	uid  uint64
+	tags graph.Tagger
+	err  error
+}
+
+func NewError(err error) *Error {
+	return &Error{uid: NextUID(), err: err}
+}
+
+func (it *Error) UID() uint64 {
+	return it.uid
+}
+
+func (it *Error) Tagger() *graph.Tagger {
+	return &it.tags
+}
+
+// Fill the map based on the tags assigned to this iterator.
+func (it *Error) TagResults(dst map[string]graph.Value) {
+	it.tags.TagResult(dst, it.Result())
+}
+
+func (it *Error) Contains(graph.Value) bool {
+	return false
+}
+
+func (it *Error) Clone() graph.Iterator { return NewNull() }
+
+func (it *Error) Type() graph.Type { return graph.Null }
+
+func (it *Error) Optimize() (graph.Iterator, bool) { return it, false }
+
+func (it *Error) String() string {
+	return fmt.Sprintf("Error(%v)", it.err)
+}
+
+func (it *Error) Next() bool {
+	return false
+}
+
+func (it *Error) Err() error {
+	return it.err
+}
+
+func (it *Error) Result() graph.Value {
+	return nil
+}
+
+func (it *Error) SubIterators() []graph.Iterator {
+	return nil
+}
+
+func (it *Error) NextPath() bool {
+	return false
+}
+
+func (it *Error) Size() (int64, bool) {
+	return 0, true
+}
+
+func (it *Error) Reset() {}
+
+func (it *Error) Close() error {
+	return it.err
+}
+
+func (it *Error) Stats() graph.IteratorStats {
+	return graph.IteratorStats{}
+}

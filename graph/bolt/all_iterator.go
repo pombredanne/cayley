@@ -18,15 +18,18 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/barakmich/glog"
 	"github.com/boltdb/bolt"
+	"github.com/cayleygraph/cayley/clog"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/quad"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
 )
 
+var _ graph.Iterator = &AllIterator{}
+
 type AllIterator struct {
+	nodes  bool
 	uid    uint64
 	tags   graph.Tagger
 	bucket []byte
@@ -41,6 +44,7 @@ type AllIterator struct {
 
 func NewAllIterator(bucket []byte, d quad.Direction, qs *QuadStore) *AllIterator {
 	return &AllIterator{
+		nodes:  d == quad.Any,
 		uid:    iterator.NextUID(),
 		bucket: bucket,
 		dir:    d,
@@ -63,13 +67,7 @@ func (it *AllIterator) Tagger() *graph.Tagger {
 }
 
 func (it *AllIterator) TagResults(dst map[string]graph.Value) {
-	for _, tag := range it.tags.Tags() {
-		dst[tag] = it.Result()
-	}
-
-	for tag, value := range it.tags.Fixed() {
-		dst[tag] = value
-	}
+	it.tags.TagResult(dst, it.Result())
 }
 
 func (it *AllIterator) Clone() graph.Iterator {
@@ -94,12 +92,11 @@ func (it *AllIterator) Next() bool {
 			b := tx.Bucket(it.bucket)
 			cur := b.Cursor()
 			if last == nil {
-				k, _ := cur.First()
-				var out []byte
-				out = make([]byte, len(k))
-				copy(out, k)
-				it.buffer = append(it.buffer, out)
-				i++
+				k, v := cur.First()
+				if it.nodes || isLiveValue(v) {
+					it.buffer = append(it.buffer, clone(k))
+					i++
+				}
 			} else {
 				k, _ := cur.Seek(last)
 				if !bytes.Equal(k, last) {
@@ -107,21 +104,21 @@ func (it *AllIterator) Next() bool {
 				}
 			}
 			for i < bufferSize {
-				k, _ := cur.Next()
+				k, v := cur.Next()
 				if k == nil {
 					it.buffer = append(it.buffer, k)
 					break
 				}
-				var out []byte
-				out = make([]byte, len(k))
-				copy(out, k)
-				it.buffer = append(it.buffer, out)
+				if !it.nodes && !isLiveValue(v) {
+					continue
+				}
+				it.buffer = append(it.buffer, clone(k))
 				i++
 			}
 			return nil
 		})
 		if err != nil {
-			glog.Error("Error nexting in database: ", err)
+			clog.Errorf("Error nexting in database: %v", err)
 			it.err = err
 			it.done = true
 			return false
@@ -153,7 +150,7 @@ func (it *AllIterator) Result() graph.Value {
 	if it.buffer[it.offset] == nil {
 		return nil
 	}
-	return &Token{bucket: it.bucket, key: it.buffer[it.offset]}
+	return &Token{nodes: it.nodes, bucket: it.bucket, key: it.buffer[it.offset]}
 }
 
 func (it *AllIterator) NextPath() bool {
@@ -178,18 +175,11 @@ func (it *AllIterator) Close() error {
 }
 
 func (it *AllIterator) Size() (int64, bool) {
-	return it.qs.size, true
+	return it.qs.Size(), true
 }
 
-func (it *AllIterator) Describe() graph.Description {
-	size, _ := it.Size()
-	return graph.Description{
-		UID:       it.UID(),
-		Type:      it.Type(),
-		Tags:      it.tags.Tags(),
-		Size:      size,
-		Direction: it.dir,
-	}
+func (it *AllIterator) String() string {
+	return fmt.Sprintf("BoltAll(%q)", it.bucket)
 }
 
 func (it *AllIterator) Type() graph.Type { return graph.All }
@@ -200,12 +190,11 @@ func (it *AllIterator) Optimize() (graph.Iterator, bool) {
 }
 
 func (it *AllIterator) Stats() graph.IteratorStats {
-	s, _ := it.Size()
+	s, exact := it.Size()
 	return graph.IteratorStats{
 		ContainsCost: 1,
 		NextCost:     2,
 		Size:         s,
+		ExactSize:    exact,
 	}
 }
-
-var _ graph.Nexter = &AllIterator{}

@@ -18,18 +18,13 @@ import (
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/quad"
+	"fmt"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
 )
 
-var _ graph.Nexter = &LinksTo{}
-
-var linksToType graph.Type
-
-func init() {
-	linksToType = graph.RegisterIterator("mongo-linksto")
-}
+var _ graph.Iterator = &LinksTo{}
 
 // LinksTo is a MongoDB-dependent version of a LinksTo iterator. Like the normal
 // LinksTo, it represents a set of links to a set of nodes, represented by its
@@ -74,9 +69,8 @@ func (it *LinksTo) buildConstraint() bson.M {
 }
 
 func (it *LinksTo) buildIteratorFor(d quad.Direction, val graph.Value) *mgo.Iter {
-	name := it.qs.NameOf(val)
 	constraint := it.buildConstraint()
-	constraint[d.String()] = name
+	constraint[d.String()] = string(val.(NodeHash))
 	return it.qs.db.C(it.collection).Find(constraint).Iter()
 }
 
@@ -93,13 +87,7 @@ func (it *LinksTo) Direction() quad.Direction { return it.dir }
 
 // Tag these results, and our subiterator's results.
 func (it *LinksTo) TagResults(dst map[string]graph.Value) {
-	for _, tag := range it.tags.Tags() {
-		dst[tag] = it.Result()
-	}
-
-	for tag, value := range it.tags.Fixed() {
-		dst[tag] = value
-	}
+	it.tags.TagResult(dst, it.Result())
 
 	it.primaryIt.TagResults(dst)
 }
@@ -111,44 +99,46 @@ func (it *LinksTo) Optimize() (graph.Iterator, bool) {
 
 func (it *LinksTo) Next() bool {
 	var result struct {
-		ID      string  `bson:"_id"`
-		Added   []int64 `bson:"Added"`
-		Deleted []int64 `bson:"Deleted"`
+		ID      string     `bson:"_id"`
+		Added   []bson.Raw `bson:"Added"`
+		Deleted []bson.Raw `bson:"Deleted"`
 	}
 	graph.NextLogIn(it)
-	it.runstats.Next += 1
-	if it.nextIt != nil && it.nextIt.Next(&result) {
-		it.runstats.ContainsNext += 1
-		if it.collection == "quads" && len(result.Added) <= len(result.Deleted) {
-			return it.Next()
-		}
-		it.result = result.ID
-		return graph.NextLogOut(it, it.result, true)
-	}
-
-	if it.nextIt != nil {
-		// If there's an error in the 'next' iterator, we save it and we're done.
-		it.err = it.nextIt.Err()
-		if it.err != nil {
-			return false
+next:
+	for {
+		it.runstats.Next += 1
+		if it.nextIt != nil && it.nextIt.Next(&result) {
+			it.runstats.ContainsNext += 1
+			if it.collection == "quads" && len(result.Added) <= len(result.Deleted) {
+				continue next
+			}
+			it.result = QuadHash(result.ID)
+			return graph.NextLogOut(it, true)
 		}
 
-	}
-	// Subiterator is empty, get another one
-	if !graph.Next(it.primaryIt) {
-		// Possibly save error
-		it.err = it.primaryIt.Err()
+		if it.nextIt != nil {
+			// If there's an error in the 'next' iterator, we save it and we're done.
+			it.err = it.nextIt.Err()
+			if it.err != nil {
+				return false
+			}
 
-		// We're out of nodes in our subiterator, so we're done as well.
-		return graph.NextLogOut(it, 0, false)
-	}
-	if it.nextIt != nil {
-		it.nextIt.Close()
-	}
-	it.nextIt = it.buildIteratorFor(it.dir, it.primaryIt.Result())
+		}
+		// Subiterator is empty, get another one
+		if !it.primaryIt.Next() {
+			// Possibly save error
+			it.err = it.primaryIt.Err()
 
-	// Recurse -- return the first in the next set.
-	return it.Next()
+			// We're out of nodes in our subiterator, so we're done as well.
+			return graph.NextLogOut(it, false)
+		}
+		if it.nextIt != nil {
+			it.nextIt.Close()
+		}
+		it.nextIt = it.buildIteratorFor(it.dir, it.primaryIt.Result())
+
+		// Recurse -- return the first in the next set.
+	}
 }
 
 func (it *LinksTo) Err() error {
@@ -182,7 +172,7 @@ func (it *LinksTo) NextPath() bool {
 }
 
 func (it *LinksTo) Type() graph.Type {
-	return linksToType
+	return "mongo-linksto"
 }
 
 func (it *LinksTo) Clone() graph.Iterator {
@@ -211,14 +201,8 @@ func (it *LinksTo) Contains(val graph.Value) bool {
 	return graph.ContainsLogOut(it, val, false)
 }
 
-func (it *LinksTo) Describe() graph.Description {
-	primary := it.primaryIt.Describe()
-	return graph.Description{
-		UID:       it.UID(),
-		Type:      it.Type(),
-		Direction: it.dir,
-		Iterator:  &primary,
-	}
+func (it *LinksTo) String() string {
+	return fmt.Sprintf("MongoLinks(%v)", it.lset)
 }
 
 func (it *LinksTo) Reset() {
@@ -247,6 +231,7 @@ func (it *LinksTo) Stats() graph.IteratorStats {
 		NextCost:     nextConstant + subitStats.NextCost,
 		ContainsCost: checkConstant + subitStats.ContainsCost,
 		Size:         size,
+		ExactSize:    false,
 		Next:         it.runstats.Next,
 		Contains:     it.runstats.Contains,
 		ContainsNext: it.runstats.ContainsNext,
@@ -254,7 +239,8 @@ func (it *LinksTo) Stats() graph.IteratorStats {
 }
 
 func (it *LinksTo) Size() (int64, bool) {
-	return it.Stats().Size, false
+	st := it.Stats()
+	return st.Size, st.ExactSize
 }
 
 // Return a list containing only our subiterator.

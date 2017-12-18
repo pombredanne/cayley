@@ -20,12 +20,13 @@ import (
 	ldbit "github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/quad"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
 )
 
 type AllIterator struct {
+	nodes  bool
 	uid    uint64
 	tags   graph.Tagger
 	prefix []byte
@@ -43,6 +44,7 @@ func NewAllIterator(prefix string, d quad.Direction, qs *QuadStore) *AllIterator
 	}
 
 	it := AllIterator{
+		nodes:  prefix == "z",
 		uid:    iterator.NextUID(),
 		ro:     opts,
 		iter:   qs.db.NewIterator(nil, opts),
@@ -84,13 +86,7 @@ func (it *AllIterator) Tagger() *graph.Tagger {
 }
 
 func (it *AllIterator) TagResults(dst map[string]graph.Value) {
-	for _, tag := range it.tags.Tags() {
-		dst[tag] = it.Result()
-	}
-
-	for tag, value := range it.tags.Fixed() {
-		dst[tag] = value
-	}
+	it.tags.TagResult(dst, it.Result())
 }
 
 func (it *AllIterator) Clone() graph.Iterator {
@@ -100,23 +96,36 @@ func (it *AllIterator) Clone() graph.Iterator {
 }
 
 func (it *AllIterator) Next() bool {
-	if !it.open {
+	if it.iter == nil {
 		it.result = nil
 		return false
-	}
-	var out []byte
-	out = make([]byte, len(it.iter.Key()))
-	copy(out, it.iter.Key())
-	it.iter.Next()
-	if !it.iter.Valid() {
-		it.Close()
-	}
-	if !bytes.HasPrefix(out, it.prefix) {
+	} else if !it.open {
+		it.result = nil
+		return false
+	} else if !it.iter.Valid() {
+		it.result = nil
 		it.Close()
 		return false
 	}
-	it.result = Token(out)
-	return true
+	for {
+		out := clone(it.iter.Key())
+		live := it.nodes || isLiveValue(it.iter.Value())
+		if !it.iter.Next() {
+			it.Close()
+			if !live {
+				return false
+			}
+		}
+		if !bytes.HasPrefix(out, it.prefix) {
+			it.Close()
+			return false
+		}
+		if !live {
+			continue
+		}
+		it.result = Token(out)
+		return true
+	}
 }
 
 func (it *AllIterator) Err() error {
@@ -158,15 +167,8 @@ func (it *AllIterator) Size() (int64, bool) {
 	return int64(^uint64(0) >> 1), false
 }
 
-func (it *AllIterator) Describe() graph.Description {
-	size, _ := it.Size()
-	return graph.Description{
-		UID:       it.UID(),
-		Type:      it.Type(),
-		Tags:      it.tags.Tags(),
-		Size:      size,
-		Direction: it.dir,
-	}
+func (it *AllIterator) String() string {
+	return "LeveldbAll"
 }
 
 func (it *AllIterator) Type() graph.Type { return graph.All }
@@ -177,12 +179,13 @@ func (it *AllIterator) Optimize() (graph.Iterator, bool) {
 }
 
 func (it *AllIterator) Stats() graph.IteratorStats {
-	s, _ := it.Size()
+	s, exact := it.Size()
 	return graph.IteratorStats{
 		ContainsCost: 1,
 		NextCost:     2,
 		Size:         s,
+		ExactSize:    exact,
 	}
 }
 
-var _ graph.Nexter = &AllIterator{}
+var _ graph.Iterator = &AllIterator{}

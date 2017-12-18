@@ -15,14 +15,17 @@
 package mql
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
 
-	"github.com/google/cayley/graph"
-	_ "github.com/google/cayley/graph/memstore"
-	"github.com/google/cayley/quad"
-	_ "github.com/google/cayley/writer"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/graphtest"
+	_ "github.com/cayleygraph/cayley/graph/memstore"
+	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/query"
+	_ "github.com/cayleygraph/cayley/writer"
 )
 
 // This is a simple test graph.
@@ -38,19 +41,6 @@ import (
 //          \-->|#D#|------------->+---+
 //              +---+
 //
-var simpleGraph = []quad.Quad{
-	{"A", "follows", "B", ""},
-	{"C", "follows", "B", ""},
-	{"C", "follows", "D", ""},
-	{"D", "follows", "B", ""},
-	{"B", "follows", "F", ""},
-	{"F", "follows", "G", ""},
-	{"D", "follows", "G", ""},
-	{"E", "follows", "F", ""},
-	{"B", "status", "cool", "status_graph"},
-	{"D", "status", "cool", "status_graph"},
-	{"G", "status", "cool", "status_graph"},
-}
 
 func makeTestSession(data []quad.Quad) *Session {
 	qs, _ := graph.NewQuadStore("memstore", "", nil)
@@ -72,105 +62,108 @@ var testQueries = []struct {
 		query:   `[{"id": null}]`,
 		expect: `
 			[
-				{"id": "A"},
-				{"id": "follows"},
-				{"id": "B"},
-				{"id": "C"},
-				{"id": "D"},
-				{"id": "F"},
-				{"id": "G"},
-				{"id": "E"},
-				{"id": "status"},
-				{"id": "cool"},
-				{"id": "status_graph"}
+				{"id": "<alice>"},
+				{"id": "<follows>"},
+				{"id": "<bob>"},
+				{"id": "<fred>"},
+				{"id": "<status>"},
+				{"id": "cool_person"},
+				{"id": "<charlie>"},
+				{"id": "<dani>"},
+				{"id": "<greg>"},
+				{"id": "<emily>"},
+				{"id": "<predicates>"},
+				{"id": "<are>"},
+				{"id": "smart_person"},
+				{"id": "<smart_graph>"}
 			]
 		`,
 	},
 	{
 		message: "get nodes by status",
-		query:   `[{"id": null, "status": "cool"}]`,
+		query:   `[{"id": null, "<status>": "cool_person"}]`,
 		expect: `
 			[
-				{"id": "B", "status": "cool"},
-				{"id": "D", "status": "cool"},
-				{"id": "G", "status": "cool"}
+				{"id": "<bob>", "<status>": "cool_person"},
+				{"id": "<dani>", "<status>": "cool_person"},
+				{"id": "<greg>", "<status>": "cool_person"}
 			]
 		`,
 	},
 	{
 		message: "show correct null semantics",
-		query:   `[{"id": "cool", "status": null}]`,
+		query:   `[{"id": "cool_person", "status": null}]`,
 		expect: `
 			[
-				{"id": "cool", "status": null}
+				{"id": "cool_person", "status": null}
 			]
 		`,
 	},
 	{
 		message: "get correct follows list",
-		query:   `[{"id": "C", "follows": []}]`,
+		query:   `[{"id": "<charlie>", "<follows>": []}]`,
 		expect: `
 			[
-				{"id": "C", "follows": ["B", "D"]}
+				{"id": "<charlie>", "<follows>": ["<bob>", "<dani>"]}
 			]
 		`,
 	},
 	{
 		message: "get correct reverse follows list",
-		query:   `[{"id": "F", "!follows": []}]`,
+		query:   `[{"id": "<fred>", "!<follows>": []}]`,
 		expect: `
 			[
-				{"id": "F", "!follows": ["B", "E"]}
+				{"id": "<fred>", "!<follows>": ["<bob>", "<emily>"]}
 			]
 		`,
 	},
 	{
 		message: "get correct follows struct",
-		query:   `[{"id": null, "follows": {"id": null, "status": "cool"}}]`,
+		query:   `[{"id": null, "<follows>": {"id": null, "<status>": "cool_person"}}]`,
 		expect: `
 			[
-				{"id": "A", "follows": {"id": "B", "status": "cool"}},
-				{"id": "C", "follows": {"id": "D", "status": "cool"}},
-				{"id": "D", "follows": {"id": "G", "status": "cool"}},
-				{"id": "F", "follows": {"id": "G", "status": "cool"}}
+				{"id": "<alice>", "<follows>": {"id": "<bob>", "<status>": "cool_person"}},
+				{"id": "<charlie>", "<follows>": {"id": "<dani>", "<status>": "cool_person"}},
+				{"id": "<dani>", "<follows>": {"id": "<greg>", "<status>": "cool_person"}},
+				{"id": "<fred>", "<follows>": {"id": "<greg>", "<status>": "cool_person"}}
 			]
 		`,
 	},
 	{
 		message: "get correct reverse follows struct",
-		query:   `[{"id": null, "!follows": [{"id": null, "status" : "cool"}]}]`,
+		query:   `[{"id": null, "!<follows>": [{"id": null, "<status>" : "cool_person"}]}]`,
 		expect: `
 			[
-				{"id": "F", "!follows": [{"id": "B", "status": "cool"}]},
-				{"id": "B", "!follows": [{"id": "D", "status": "cool"}]},
-				{"id": "G", "!follows": [{"id": "D", "status": "cool"}]}
+				{"id": "<fred>", "!<follows>": [{"id": "<bob>", "<status>": "cool_person"}]},
+				{"id": "<bob>", "!<follows>": [{"id": "<dani>", "<status>": "cool_person"}]},
+				{"id": "<greg>", "!<follows>": [{"id": "<dani>", "<status>": "cool_person"}]}
 			]
 		`,
 	},
 	{
 		message: "get correct co-follows",
-		query:   `[{"id": null, "@A:follows": "B", "@B:follows": "D"}]`,
+		query:   `[{"id": null, "@A:<follows>": "<bob>", "@B:<follows>": "<dani>"}]`,
 		expect: `
 			[
-				{"id": "C", "@A:follows": "B", "@B:follows": "D"}
+				{"id": "<charlie>", "@A:<follows>": "<bob>", "@B:<follows>": "<dani>"}
 			]
 		`,
 	},
 	{
 		message: "get correct reverse co-follows",
-		query:   `[{"id": null, "!follows": {"id": "C"}, "@A:!follows": "D"}]`,
+		query:   `[{"id": null, "!<follows>": {"id": "<charlie>"}, "@A:!<follows>": "<dani>"}]`,
 		expect: `
 			[
-				{"id": "B", "!follows": {"id": "C"}, "@A:!follows": "D"}
+				{"id": "<bob>", "!<follows>": {"id": "<charlie>"}, "@A:!<follows>": "<dani>"}
 			]
 		`,
 	},
 }
 
-func runQuery(g []quad.Quad, query string) interface{} {
+func runQuery(g []quad.Quad, qu string) interface{} {
 	s := makeTestSession(g)
-	c := make(chan interface{}, 5)
-	go s.Execute(query, c, -1)
+	c := make(chan query.Result, 5)
+	go s.Execute(context.TODO(), qu, c, -1)
 	for result := range c {
 		s.Collate(result)
 	}
@@ -179,16 +172,19 @@ func runQuery(g []quad.Quad, query string) interface{} {
 }
 
 func TestMQL(t *testing.T) {
+	simpleGraph := graphtest.LoadGraph(t, "../../data/testdata.nq")
 	for _, test := range testQueries {
-		got := runQuery(simpleGraph, test.query)
-		var expect interface{}
-		json.Unmarshal([]byte(test.expect), &expect)
-		if !reflect.DeepEqual(got, expect) {
-			b, err := json.MarshalIndent(got, "", " ")
-			if err != nil {
-				t.Fatalf("unexpected JSON marshal error: %v", err)
+		t.Run(test.message, func(t *testing.T) {
+			got := runQuery(simpleGraph, test.query)
+			var expect interface{}
+			json.Unmarshal([]byte(test.expect), &expect)
+			if !reflect.DeepEqual(got, expect) {
+				b, err := json.MarshalIndent(got, "", " ")
+				if err != nil {
+					t.Fatalf("unexpected JSON marshal error: %v", err)
+				}
+				t.Errorf("got: %s expected: %s", b, test.expect)
 			}
-			t.Errorf("Failed to %s, got: %s expected: %s", test.message, b, test.expect)
-		}
+		})
 	}
 }

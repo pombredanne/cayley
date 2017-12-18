@@ -17,31 +17,38 @@ package sexp
 // Defines a running session of the sexp query language.
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"sort"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/query"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/query"
 )
 
+const Name = "sexp"
+
+func init() {
+	query.RegisterLanguage(query.Language{
+		Name: Name,
+		Session: func(qs graph.QuadStore) query.Session {
+			return NewSession(qs)
+		},
+		REPL: func(qs graph.QuadStore) query.REPLSession {
+			return NewSession(qs)
+		},
+	})
+}
+
 type Session struct {
-	qs    graph.QuadStore
-	debug bool
+	qs graph.QuadStore
 }
 
 func NewSession(qs graph.QuadStore) *Session {
-	var s Session
-	s.qs = qs
-	return &s
+	return &Session{qs: qs}
 }
 
-func (s *Session) Debug(ok bool) {
-	s.debug = ok
-}
-
-func (s *Session) Parse(input string) (query.ParseResult, error) {
+func (s *Session) Parse(input string) error {
 	var parenDepth int
 	for i, x := range input {
 		if x == '(' {
@@ -54,59 +61,42 @@ func (s *Session) Parse(input string) (query.ParseResult, error) {
 				if (i - 10) > min {
 					min = i - 10
 				}
-				return query.ParseFail, fmt.Errorf("too many close parentheses at char %d: %s", i, input[min:i])
+				return fmt.Errorf("too many close parentheses at char %d: %s", i, input[min:i])
 			}
 		}
 	}
 	if parenDepth > 0 {
-		return query.ParseMore, nil
+		return query.ErrParseMore
 	}
 	if len(ParseString(input)) > 0 {
-		return query.Parsed, nil
+		return nil
 	}
-	return query.ParseFail, errors.New("invalid syntax")
+	return errors.New("invalid syntax")
 }
 
-func (s *Session) Execute(input string, out chan interface{}, limit int) {
+func (s *Session) Execute(ctx context.Context, input string, out chan query.Result, limit int) {
+	defer close(out)
 	it := BuildIteratorTreeForQuery(s.qs, input)
-	newIt, changed := it.Optimize()
-	if changed {
-		it = newIt
-	}
-
-	if s.debug {
-		b, err := json.MarshalIndent(it.Describe(), "", "  ")
-		if err != nil {
-			fmt.Printf("failed to format description: %v", err)
-		} else {
-			fmt.Printf("%s", b)
+	err := graph.Iterate(ctx, it).Paths(true).Limit(limit).TagEach(func(tags map[string]graph.Value) {
+		select {
+		case out <- query.TagMapResult(tags):
+		case <-ctx.Done():
+		}
+	})
+	if err != nil {
+		select {
+		case out <- query.ErrorResult(err):
+		case <-ctx.Done():
 		}
 	}
-	nResults := 0
-	for graph.Next(it) {
-		tags := make(map[string]graph.Value)
-		it.TagResults(tags)
-		out <- &tags
-		nResults++
-		if nResults > limit && limit != -1 {
-			break
-		}
-		for it.NextPath() == true {
-			tags := make(map[string]graph.Value)
-			it.TagResults(tags)
-			out <- &tags
-			nResults++
-			if nResults > limit && limit != -1 {
-				break
-			}
-		}
-	}
-	close(out)
 }
 
-func (s *Session) Format(result interface{}) string {
+func (s *Session) FormatREPL(result query.Result) string {
 	out := fmt.Sprintln("****")
-	tags := result.(map[string]graph.Value)
+	tags, ok := result.Result().(map[string]graph.Value)
+	if !ok {
+		return ""
+	}
 	tagKeys := make([]string, len(tags))
 	i := 0
 	for k := range tags {

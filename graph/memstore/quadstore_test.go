@@ -19,10 +19,12 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/quad"
-	"github.com/google/cayley/writer"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/graphtest"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/writer"
+	"github.com/stretchr/testify/require"
 )
 
 // This is a simple test graph.
@@ -39,17 +41,17 @@ import (
 //              +---+
 //
 var simpleGraph = []quad.Quad{
-	{"A", "follows", "B", ""},
-	{"C", "follows", "B", ""},
-	{"C", "follows", "D", ""},
-	{"D", "follows", "B", ""},
-	{"B", "follows", "F", ""},
-	{"F", "follows", "G", ""},
-	{"D", "follows", "G", ""},
-	{"E", "follows", "F", ""},
-	{"B", "status", "cool", "status_graph"},
-	{"D", "status", "cool", "status_graph"},
-	{"G", "status", "cool", "status_graph"},
+	quad.MakeRaw("A", "follows", "B", ""),
+	quad.MakeRaw("C", "follows", "B", ""),
+	quad.MakeRaw("C", "follows", "D", ""),
+	quad.MakeRaw("D", "follows", "B", ""),
+	quad.MakeRaw("B", "follows", "F", ""),
+	quad.MakeRaw("F", "follows", "G", ""),
+	quad.MakeRaw("D", "follows", "G", ""),
+	quad.MakeRaw("E", "follows", "F", ""),
+	quad.MakeRaw("B", "status", "cool", "status_graph"),
+	quad.MakeRaw("D", "status", "cool", "status_graph"),
+	quad.MakeRaw("G", "status", "cool", "status_graph"),
 }
 
 func makeTestStore(data []quad.Quad) (*QuadStore, graph.QuadWriter, []pair) {
@@ -61,7 +63,8 @@ func makeTestStore(data []quad.Quad) (*QuadStore, graph.QuadWriter, []pair) {
 	)
 	writer, _ := writer.NewSingleReplication(qs, nil)
 	for _, t := range data {
-		for _, qp := range []string{t.Subject, t.Predicate, t.Object, t.Label} {
+		for _, dir := range quad.Directions {
+			qp := t.GetString(dir)
 			if _, ok := seen[qp]; !ok && qp != "" {
 				val++
 				ind = append(ind, pair{qp, val})
@@ -70,8 +73,17 @@ func makeTestStore(data []quad.Quad) (*QuadStore, graph.QuadWriter, []pair) {
 		}
 
 		writer.AddQuad(t)
+		val++
 	}
 	return qs, writer, ind
+}
+
+func TestMemstoreAll(t *testing.T) {
+	graphtest.TestAll(t, func(t testing.TB) (graph.QuadStore, graph.Options, func()) {
+		return newQuadStore(), nil, func() {}
+	}, &graphtest.Config{
+		SkipNodeDelAfterQuadDel: true,
+	})
 }
 
 type pair struct {
@@ -81,18 +93,15 @@ type pair struct {
 
 func TestMemstore(t *testing.T) {
 	qs, _, index := makeTestStore(simpleGraph)
-	if size := qs.Size(); size != int64(len(simpleGraph)) {
-		t.Errorf("Quad store has unexpected size, got:%d expected %d", size, len(simpleGraph))
-	}
+	require.Equal(t, int64(22), qs.Size())
+
 	for _, test := range index {
-		v := qs.ValueOf(test.query)
+		v := qs.ValueOf(quad.Raw(test.query))
 		switch v := v.(type) {
 		default:
 			t.Errorf("ValueOf(%q) returned unexpected type, got:%T expected int64", test.query, v)
-		case int64:
-			if v != test.value {
-				t.Errorf("ValueOf(%q) returned unexpected value, got:%d expected:%d", test.query, v, test.value)
-			}
+		case bnode:
+			require.Equal(t, test.value, int64(v))
 		}
 	}
 }
@@ -101,27 +110,26 @@ func TestIteratorsAndNextResultOrderA(t *testing.T) {
 	qs, _, _ := makeTestStore(simpleGraph)
 
 	fixed := qs.FixedIterator()
-	fixed.Add(qs.ValueOf("C"))
+	fixed.Add(qs.ValueOf(quad.Raw("C")))
 
 	fixed2 := qs.FixedIterator()
-	fixed2.Add(qs.ValueOf("follows"))
+	fixed2.Add(qs.ValueOf(quad.Raw("follows")))
 
 	all := qs.NodesAllIterator()
 
-	innerAnd := iterator.NewAnd(qs)
-	innerAnd.AddSubIterator(iterator.NewLinksTo(qs, fixed2, quad.Predicate))
-	innerAnd.AddSubIterator(iterator.NewLinksTo(qs, all, quad.Object))
+	innerAnd := iterator.NewAnd(qs,
+		iterator.NewLinksTo(qs, fixed2, quad.Predicate),
+		iterator.NewLinksTo(qs, all, quad.Object),
+	)
 
 	hasa := iterator.NewHasA(qs, innerAnd, quad.Subject)
-	outerAnd := iterator.NewAnd(qs)
-	outerAnd.AddSubIterator(fixed)
-	outerAnd.AddSubIterator(hasa)
+	outerAnd := iterator.NewAnd(qs, fixed, hasa)
 
 	if !outerAnd.Next() {
 		t.Error("Expected one matching subtree")
 	}
 	val := outerAnd.Result()
-	if qs.NameOf(val) != "C" {
+	if qs.NameOf(val) != quad.Raw("C") {
 		t.Errorf("Matching subtree should be %s, got %s", "barak", qs.NameOf(val))
 	}
 
@@ -130,7 +138,7 @@ func TestIteratorsAndNextResultOrderA(t *testing.T) {
 		expect = []string{"B", "D"}
 	)
 	for {
-		got = append(got, qs.NameOf(all.Result()))
+		got = append(got, quad.StringOf(qs.NameOf(all.Result())))
 		if !outerAnd.NextPath() {
 			break
 		}
@@ -150,7 +158,7 @@ func TestLinksToOptimization(t *testing.T) {
 	qs, _, _ := makeTestStore(simpleGraph)
 
 	fixed := qs.FixedIterator()
-	fixed.Add(qs.ValueOf("cool"))
+	fixed.Add(qs.ValueOf(quad.Raw("cool")))
 
 	lto := iterator.NewLinksTo(qs, fixed, quad.Object)
 	lto.Tagger().Add("foo")
@@ -159,14 +167,14 @@ func TestLinksToOptimization(t *testing.T) {
 	if !changed {
 		t.Error("Iterator didn't change")
 	}
-	if newIt.Type() != Type() {
+	if _, ok := newIt.(*Iterator); !ok {
 		t.Fatal("Didn't swap out to LLRB")
 	}
 
 	v := newIt.(*Iterator)
 	vClone := v.Clone()
-	origDesc := v.Describe()
-	cloneDesc := vClone.Describe()
+	origDesc := graph.DescribeIterator(v)
+	cloneDesc := graph.DescribeIterator(vClone)
 	origDesc.UID, cloneDesc.UID = 0, 0 // We are more strict now, so fake UID equality.
 	if !reflect.DeepEqual(cloneDesc, origDesc) {
 		t.Fatalf("Unexpected iterator description.\ngot: %#v\nexpect: %#v", cloneDesc, origDesc)
@@ -180,31 +188,32 @@ func TestLinksToOptimization(t *testing.T) {
 func TestRemoveQuad(t *testing.T) {
 	qs, w, _ := makeTestStore(simpleGraph)
 
-	err := w.RemoveQuad(quad.Quad{
-		Subject:   "E",
-		Predicate: "follows",
-		Object:    "F",
-		Label:     "",
-	})
+	err := w.RemoveQuad(quad.MakeRaw(
+		"E",
+		"follows",
+		"F",
+		"",
+	))
 
 	if err != nil {
 		t.Error("Couldn't remove quad", err)
 	}
 
 	fixed := qs.FixedIterator()
-	fixed.Add(qs.ValueOf("E"))
+	fixed.Add(qs.ValueOf(quad.Raw("E")))
 
 	fixed2 := qs.FixedIterator()
-	fixed2.Add(qs.ValueOf("follows"))
+	fixed2.Add(qs.ValueOf(quad.Raw("follows")))
 
-	innerAnd := iterator.NewAnd(qs)
-	innerAnd.AddSubIterator(iterator.NewLinksTo(qs, fixed, quad.Subject))
-	innerAnd.AddSubIterator(iterator.NewLinksTo(qs, fixed2, quad.Predicate))
+	innerAnd := iterator.NewAnd(qs,
+		iterator.NewLinksTo(qs, fixed, quad.Subject),
+		iterator.NewLinksTo(qs, fixed2, quad.Predicate),
+	)
 
 	hasa := iterator.NewHasA(qs, innerAnd, quad.Object)
 
 	newIt, _ := hasa.Optimize()
-	if graph.Next(newIt) {
+	if newIt.Next() {
 		t.Error("E should not have any followers.")
 	}
 }
@@ -214,16 +223,16 @@ func TestTransaction(t *testing.T) {
 	size := qs.Size()
 
 	tx := graph.NewTransaction()
-	tx.AddQuad(quad.Quad{
-		Subject:   "E",
-		Predicate: "follows",
-		Object:    "G",
-		Label:     ""})
-	tx.RemoveQuad(quad.Quad{
-		Subject:   "Non",
-		Predicate: "existent",
-		Object:    "quad",
-		Label:     ""})
+	tx.AddQuad(quad.MakeRaw(
+		"E",
+		"follows",
+		"G",
+		""))
+	tx.RemoveQuad(quad.MakeRaw(
+		"Non",
+		"existent",
+		"quad",
+		""))
 
 	err := w.ApplyTransaction(tx)
 	if err == nil {

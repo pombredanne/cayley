@@ -16,129 +16,155 @@ package http
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
 
-	"github.com/barakmich/glog"
 	"github.com/julienschmidt/httprouter"
 
-	"github.com/google/cayley/internal"
-	"github.com/google/cayley/quad"
-	"github.com/google/cayley/quad/cquads"
+	"github.com/cayleygraph/cayley/clog"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/internal/decompressor"
+	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/quad/nquads"
 )
 
-func ParseJSONToQuadList(jsonBody []byte) ([]quad.Quad, error) {
-	var quads []quad.Quad
+func ParseJSONToQuadList(jsonBody []byte) (out []quad.Quad, _ error) {
+	var quads []struct {
+		Subject   string `json:"subject"`
+		Predicate string `json:"predicate"`
+		Object    string `json:"object"`
+		Label     string `json:"label"`
+	}
 	err := json.Unmarshal(jsonBody, &quads)
 	if err != nil {
 		return nil, err
 	}
-	for i, q := range quads {
+	out = make([]quad.Quad, 0, len(quads))
+	for i, jq := range quads {
+		q := quad.Quad{
+			Subject:   quad.StringToValue(jq.Subject),
+			Predicate: quad.StringToValue(jq.Predicate),
+			Object:    quad.StringToValue(jq.Object),
+			Label:     quad.StringToValue(jq.Label),
+		}
 		if !q.IsValid() {
 			return nil, fmt.Errorf("invalid quad at index %d. %s", i, q)
 		}
+		out = append(out, q)
 	}
-	return quads, nil
+	return out, nil
 }
 
-func (api *API) ServeV1Write(w http.ResponseWriter, r *http.Request, _ httprouter.Params) int {
-	if api.config.ReadOnly {
-		return jsonResponse(w, 400, "Database is read-only.")
+const maxQuerySize = 1024 * 1024 // 1 MB
+func readLimit(r io.Reader) ([]byte, error) {
+	lr := io.LimitReader(r, maxQuerySize).(*io.LimitedReader)
+	data, err := ioutil.ReadAll(lr)
+	if err != nil && lr.N <= 0 {
+		err = errors.New("request is too large")
 	}
-	bodyBytes, err := ioutil.ReadAll(r.Body)
+	return data, err
+}
+
+func (api *API) ServeV1Write(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	if api.config.ReadOnly {
+		jsonResponse(w, 400, "Database is read-only.")
+		return
+	}
+	// TODO: streaming reader
+	bodyBytes, err := readLimit(r.Body)
 	if err != nil {
-		return jsonResponse(w, 400, err)
+		jsonResponse(w, 400, err)
+		return
 	}
 	quads, err := ParseJSONToQuadList(bodyBytes)
 	if err != nil {
-		return jsonResponse(w, 400, err)
+		jsonResponse(w, 400, err)
+		return
 	}
 	h, err := api.GetHandleForRequest(r)
 	if err != nil {
-		return jsonResponse(w, 400, err)
+		jsonResponse(w, 400, err)
+		return
 	}
-
-	h.QuadWriter.AddQuadSet(quads)
+	if err = h.QuadWriter.AddQuadSet(quads); err != nil {
+		jsonResponse(w, 400, err)
+		return
+	}
 	fmt.Fprintf(w, "{\"result\": \"Successfully wrote %d quads.\"}", len(quads))
-	return 200
 }
 
-func (api *API) ServeV1WriteNQuad(w http.ResponseWriter, r *http.Request, params httprouter.Params) int {
+func (api *API) ServeV1WriteNQuad(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	if api.config.ReadOnly {
-		return jsonResponse(w, 400, "Database is read-only.")
+		jsonResponse(w, 400, "Database is read-only.")
+		return
 	}
 
 	formFile, _, err := r.FormFile("NQuadFile")
 	if err != nil {
-		glog.Errorln(err)
-		return jsonResponse(w, 500, "Couldn't read file: "+err.Error())
+		clog.Errorf("%v", err)
+		jsonResponse(w, 500, "Couldn't read file: "+err.Error())
+		return
 	}
 	defer formFile.Close()
 
-	blockSize, blockErr := strconv.ParseInt(r.URL.Query().Get("block_size"), 10, 64)
+	blockSize, blockErr := strconv.Atoi(r.URL.Query().Get("block_size"))
 	if blockErr != nil {
-		blockSize = int64(api.config.LoadSize)
+		blockSize = quad.DefaultBatch
 	}
 
-	quadReader, err := internal.Decompressor(formFile)
+	quadReader, err := decompressor.New(formFile)
 	// TODO(kortschak) Make this configurable from the web UI.
-	dec := cquads.NewDecoder(quadReader)
+	dec := nquads.NewReader(quadReader, false)
 
 	h, err := api.GetHandleForRequest(r)
 	if err != nil {
-		return jsonResponse(w, 400, err)
+		jsonResponse(w, 400, err)
+		return
 	}
-
-	var (
-		n     int
-		block = make([]quad.Quad, 0, blockSize)
-	)
-	for {
-		t, err := dec.Unmarshal()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			glog.Fatalln("what can do this here?", err) // FIXME(kortschak)
-		}
-		block = append(block, t)
-		n++
-		if len(block) == cap(block) {
-			h.QuadWriter.AddQuadSet(block)
-			block = block[:0]
-		}
+	qw := graph.NewWriter(h.QuadWriter)
+	n, err := quad.CopyBatch(qw, dec, blockSize)
+	if err != nil {
+		jsonResponse(w, 400, err)
+		return
 	}
-	h.QuadWriter.AddQuadSet(block)
-
+	err = qw.Close()
+	if err != nil {
+		jsonResponse(w, 400, err)
+		return
+	}
 	fmt.Fprintf(w, "{\"result\": \"Successfully wrote %d quads.\"}", n)
-
-	return 200
 }
 
-func (api *API) ServeV1Delete(w http.ResponseWriter, r *http.Request, params httprouter.Params) int {
+func (api *API) ServeV1Delete(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	if api.config.ReadOnly {
-		return jsonResponse(w, 400, "Database is read-only.")
+		jsonResponse(w, 400, "Database is read-only.")
+		return
 	}
-	bodyBytes, err := ioutil.ReadAll(r.Body)
+	bodyBytes, err := readLimit(r.Body)
 	if err != nil {
-		return jsonResponse(w, 400, err)
+		jsonResponse(w, 400, err)
+		return
 	}
 	quads, err := ParseJSONToQuadList(bodyBytes)
 	if err != nil {
-		return jsonResponse(w, 400, err)
+		jsonResponse(w, 400, err)
+		return
 	}
 	h, err := api.GetHandleForRequest(r)
 	if err != nil {
-		return jsonResponse(w, 400, err)
+		jsonResponse(w, 400, err)
+		return
 	}
-	count := 0
 	for _, q := range quads {
-		h.QuadWriter.RemoveQuad(q)
-		count++
+		err = h.QuadWriter.RemoveQuad(q)
+		if err != nil && !graph.IsQuadNotExist(err) {
+			jsonResponse(w, 400, err)
+			return
+		}
 	}
-	fmt.Fprintf(w, "{\"result\": \"Successfully deleted %d quads.\"}", count)
-	return 200
+	fmt.Fprintf(w, "{\"result\": \"Successfully deleted %d quads.\"}", len(quads))
 }

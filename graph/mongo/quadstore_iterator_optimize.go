@@ -15,10 +15,14 @@
 package mongo
 
 import (
-	"github.com/barakmich/glog"
+	"time"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
+	"gopkg.in/mgo.v2/bson"
+
+	"github.com/cayleygraph/cayley/clog"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
 )
 
 func (qs *QuadStore) OptimizeIterator(it graph.Iterator) (graph.Iterator, bool) {
@@ -27,36 +31,45 @@ func (qs *QuadStore) OptimizeIterator(it graph.Iterator) (graph.Iterator, bool) 
 		return qs.optimizeLinksTo(it.(*iterator.LinksTo))
 	case graph.And:
 		return qs.optimizeAndIterator(it.(*iterator.And))
-
+	case graph.Comparison:
+		return qs.optimizeComparison(it.(*iterator.Comparison))
 	}
 	return it, false
 }
 
 func (qs *QuadStore) optimizeAndIterator(it *iterator.And) (graph.Iterator, bool) {
 	// Fail fast if nothing can happen
-	glog.V(4).Infoln("Entering optimizeAndIterator", it.UID())
+	if clog.V(4) {
+		clog.Infof("Entering optimizeAndIterator %v", it.UID())
+	}
 	found := false
 	for _, it := range it.SubIterators() {
-		glog.V(4).Infoln(it.Type())
-		if it.Type() == mongoType {
+		if clog.V(4) {
+			clog.Infof("%v", it.Type())
+		}
+		if _, ok := it.(*Iterator); ok {
 			found = true
 		}
 	}
 	if !found {
-		glog.V(4).Infoln("Aborting optimizeAndIterator")
+		if clog.V(4) {
+			clog.Infof("Aborting optimizeAndIterator")
+		}
 		return it, false
 	}
 
 	newAnd := iterator.NewAnd(qs)
 	var mongoIt *Iterator
 	for _, it := range it.SubIterators() {
-		switch it.Type() {
-		case mongoType:
+		if sit, ok := it.(*Iterator); ok {
 			if mongoIt == nil {
-				mongoIt = it.(*Iterator)
+				mongoIt = sit
 			} else {
 				newAnd.AddSubIterator(it)
 			}
+			continue
+		}
+		switch it.Type() {
 		case graph.LinksTo:
 			continue
 		default:
@@ -67,8 +80,8 @@ func (qs *QuadStore) optimizeAndIterator(it *iterator.And) (graph.Iterator, bool
 
 	lset := []graph.Linkage{
 		{
-			Dir:    mongoIt.dir,
-			Value: qs.ValueOf(mongoIt.name),
+			Dir:   mongoIt.dir,
+			Value: mongoIt.hash,
 		},
 	}
 
@@ -102,7 +115,7 @@ func (qs *QuadStore) optimizeLinksTo(it *iterator.LinksTo) (graph.Iterator, bool
 	if primary.Type() == graph.Fixed {
 		size, _ := primary.Size()
 		if size == 1 {
-			if !graph.Next(primary) {
+			if !primary.Next() {
 				panic("unexpected size during optimize")
 			}
 			val := primary.Result()
@@ -117,4 +130,64 @@ func (qs *QuadStore) optimizeLinksTo(it *iterator.LinksTo) (graph.Iterator, bool
 		}
 	}
 	return it, false
+}
+
+func (qs *QuadStore) optimizeComparison(it *iterator.Comparison) (graph.Iterator, bool) {
+	subs := it.SubIterators()
+	if len(subs) != 1 {
+		return it, false
+	}
+	mit, ok := subs[0].(*Iterator)
+	if !ok || !mit.isAll {
+		return it, false
+	}
+	name := ""
+	switch it.Operator() {
+	case iterator.CompareGT:
+		name = "$gt"
+	case iterator.CompareGTE:
+		name = "$gte"
+	case iterator.CompareLT:
+		name = "$lt"
+	case iterator.CompareLTE:
+		name = "$lte"
+	default:
+		return it, false
+	}
+
+	var constraint bson.M
+	const base = "Name"
+	switch v := it.Value().(type) {
+	case quad.String:
+		constraint = bson.M{
+			base + ".val":   bson.M{name: string(v)},
+			base + ".iri":   bson.M{"$ne": true},
+			base + ".bnode": bson.M{"$ne": true},
+		}
+	case quad.IRI:
+		constraint = bson.M{
+			base + ".val": bson.M{name: string(v)},
+			base + ".iri": true,
+		}
+	case quad.BNode:
+		constraint = bson.M{
+			base + ".val":   bson.M{name: string(v)},
+			base + ".bnode": true,
+		}
+	case quad.Int:
+		constraint = bson.M{
+			base: bson.M{name: int64(v)},
+		}
+	case quad.Float:
+		constraint = bson.M{
+			base: bson.M{name: float64(v)},
+		}
+	case quad.Time:
+		constraint = bson.M{
+			base: bson.M{name: time.Time(v)},
+		}
+	default:
+		return it, false
+	}
+	return NewIteratorWithConstraints(qs, mit.collection, constraint), true
 }

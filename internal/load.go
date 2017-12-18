@@ -3,39 +3,52 @@ package internal
 import (
 	"fmt"
 	"io"
-	client "net/http"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/internal/config"
-	"github.com/google/cayley/internal/db"
-	"github.com/google/cayley/quad"
-	"github.com/google/cayley/quad/cquads"
-	"github.com/google/cayley/quad/nquads"
+	"github.com/cayleygraph/cayley/clog"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/internal/decompressor"
+	"github.com/cayleygraph/cayley/quad"
+	"github.com/cayleygraph/cayley/quad/nquads"
 )
 
 // Load loads a graph from the given path and write it to qw.  See
 // DecompressAndLoad for more information.
-func Load(qw graph.QuadWriter, cfg *config.Config, path, typ string) error {
-	return DecompressAndLoad(qw, cfg, path, typ, db.Load)
+func Load(qw graph.QuadWriter, batch int, path, typ string) error {
+	return DecompressAndLoad(qw, batch, path, typ, nil)
 }
 
-// DecompressAndLoad will load or fetch a graph from the given path, decompress
-// it, and then call the given load function to process the decompressed graph.
-// If no loadFn is provided, db.Load is called.
-func DecompressAndLoad(qw graph.QuadWriter, cfg *config.Config, path, typ string, loadFn func(graph.QuadWriter, *config.Config, quad.Unmarshaler) error) error {
-	var r io.Reader
+type readCloser struct {
+	quad.ReadCloser
+	close func() error
+}
 
-	if path == "" {
-		path = cfg.DatabasePath
+func (r readCloser) Close() error {
+	err := r.ReadCloser.Close()
+	if r.close != nil {
+		r.close()
 	}
-	if path == "" {
-		return nil
-	}
-	u, err := url.Parse(path)
-	if err != nil || u.Scheme == "file" || u.Scheme == "" {
+	return err
+}
+
+type nopCloser struct {
+	quad.Reader
+}
+
+func (r nopCloser) Close() error { return nil }
+
+func QuadReaderFor(path, typ string) (quad.ReadCloser, error) {
+	var (
+		r io.Reader
+		c io.Closer
+	)
+	if path == "-" {
+		r = os.Stdin
+	} else if u, err := url.Parse(path); err != nil || u.Scheme == "file" || u.Scheme == "" {
 		// Don't alter relative URL path or non-URL path parameter.
 		if u.Scheme != "" && err == nil {
 			// Recovery heuristic for mistyping "file://path/to/file".
@@ -43,40 +56,103 @@ func DecompressAndLoad(qw graph.QuadWriter, cfg *config.Config, path, typ string
 		}
 		f, err := os.Open(path)
 		if err != nil {
-			return fmt.Errorf("could not open file %q: %v", path, err)
+			return nil, fmt.Errorf("could not open file %q: %v", path, err)
 		}
-		defer f.Close()
-		r = f
+		r, c = f, f
 	} else {
-		res, err := client.Get(path)
+		res, err := http.Get(path)
 		if err != nil {
-			return fmt.Errorf("could not get resource <%s>: %v", u, err)
+			return nil, fmt.Errorf("could not get resource <%s>: %v", u, err)
 		}
-		defer res.Body.Close()
-		r = res.Body
+		// TODO(dennwc): save content type for format auto-detection
+		r, c = res.Body, res.Body
 	}
 
-	r, err = Decompressor(r)
+	r, err := decompressor.New(r)
 	if err != nil {
-		if err == io.EOF {
-			return nil
+		if c != nil {
+			c.Close()
 		}
-		return err
+		if err == io.EOF {
+			return nopCloser{quad.NewReader(nil)}, nil
+		}
+		return nil, err
 	}
 
-	var dec quad.Unmarshaler
+	var qr quad.ReadCloser
 	switch typ {
 	case "cquad":
-		dec = cquads.NewDecoder(r)
+		qr = nquads.NewReader(r, false)
 	case "nquad":
-		dec = nquads.NewDecoder(r)
+		qr = nquads.NewReader(r, true)
 	default:
-		return fmt.Errorf("unknown quad format %q", typ)
+		var format *quad.Format
+		if typ == "" {
+			name := filepath.Base(path)
+			name = strings.TrimSuffix(name, ".gz")
+			name = strings.TrimSuffix(name, ".bz2")
+			format = quad.FormatByExt(filepath.Ext(name))
+			if format == nil {
+				typ = "nquads"
+			}
+		}
+		if format == nil {
+			format = quad.FormatByName(typ)
+		}
+		if format == nil {
+			err = fmt.Errorf("unknown quad format %q", typ)
+		} else if format.Reader == nil {
+			err = fmt.Errorf("decoding of %q is not supported", typ)
+		}
+		if err != nil {
+			if c != nil {
+				c.Close()
+			}
+			return nil, err
+		}
+		qr = format.Reader(r)
 	}
-
-	if loadFn != nil {
-		return loadFn(qw, cfg, dec)
+	if c != nil {
+		return readCloser{ReadCloser: qr, close: c.Close}, nil
 	}
+	return qr, nil
+}
 
-	return db.Load(qw, cfg, dec)
+// DecompressAndLoad will load or fetch a graph from the given path, decompress
+// it, and then call the given load function to process the decompressed graph.
+// If no loadFn is provided, db.Load is called.
+func DecompressAndLoad(qw graph.QuadWriter, batch int, path, typ string, writerFunc func(graph.QuadWriter) graph.BatchWriter) error {
+	if path == "" {
+		return nil
+	}
+	qr, err := QuadReaderFor(path, typ)
+	if err != nil {
+		return err
+	}
+	defer qr.Close()
+
+	if writerFunc == nil {
+		writerFunc = graph.NewWriter
+	}
+	dest := writerFunc(qw)
+
+	_, err = quad.CopyBatch(&batchLogger{BatchWriter: dest}, qr, batch)
+	if err != nil {
+		return fmt.Errorf("db: failed to load data: %v", err)
+	}
+	return dest.Close()
+}
+
+type batchLogger struct {
+	cnt int
+	quad.BatchWriter
+}
+
+func (w *batchLogger) WriteQuads(quads []quad.Quad) (int, error) {
+	n, err := w.BatchWriter.WriteQuads(quads)
+	if clog.V(2) {
+		w.cnt += n
+		clog.Infof("Wrote %d quads.", w.cnt)
+	}
+	return n, err
 }

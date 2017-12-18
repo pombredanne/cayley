@@ -15,36 +15,37 @@
 package integration
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
 	"sort"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/internal"
-	"github.com/google/cayley/internal/config"
-	"github.com/google/cayley/internal/db"
-	"github.com/google/cayley/quad"
-	"github.com/google/cayley/query/gremlin"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/internal"
+	"github.com/cayleygraph/cayley/internal/config"
+	"github.com/cayleygraph/cayley/internal/db"
+	"github.com/cayleygraph/cayley/query"
+	"github.com/cayleygraph/cayley/query/gizmo"
 
 	// Load all supported backends.
-	_ "github.com/google/cayley/graph/bolt"
-	_ "github.com/google/cayley/graph/leveldb"
-	_ "github.com/google/cayley/graph/memstore"
-	_ "github.com/google/cayley/graph/mongo"
-	_ "github.com/google/cayley/graph/sql"
+	_ "github.com/cayleygraph/cayley/graph/all"
 
 	// Load writer registry
-	_ "github.com/google/cayley/writer"
+	_ "github.com/cayleygraph/cayley/writer"
 )
 
-var backend = flag.String("backend", "memstore", "Which backend to test. Loads test data to /tmp if not present.")
-var backendPath = flag.String("backend_path", "", "Path to the chosen backend. Will have sane testing defaults if not specified")
+const format = "cquad"
+
+var (
+	backend     = flag.String("backend", "memstore", "Which backend to test. Loads test data to /tmp if not present.")
+	backendPath = flag.String("backend_path", "", "Path to the chosen backend. Will have sane testing defaults if not specified")
+	sqlFlavor   = flag.String("flavor", "postgres", "SQL flavour")
+)
 
 var benchmarkQueries = []struct {
 	message string
@@ -59,10 +60,10 @@ var benchmarkQueries = []struct {
 	{
 		message: "name predicate",
 		query: `
-		g.V("Humphrey Bogart").In("name").All()
+		g.V("Humphrey Bogart").In("<name>").All()
 		`,
 		expect: []interface{}{
-			map[string]string{"id": "/en/humphrey_bogart"},
+			map[string]string{"id": "</en/humphrey_bogart>"},
 		},
 	},
 
@@ -72,11 +73,11 @@ var benchmarkQueries = []struct {
 	{
 		message: "two large sets with no intersection",
 		query: `
-		function getId(x) { return g.V(x).In("name") }
-		var actor_to_film = g.M().In("/film/performance/actor").In("/film/film/starring")
+		function getId(x) { return g.V(x).In("<name>") }
+		var actor_to_film = g.M().In("</film/performance/actor>").In("</film/film/starring>")
 
-		getId("Oliver Hardy").Follow(actor_to_film).Out("name").Intersect(
-			getId("Mel Blanc").Follow(actor_to_film).Out("name")).All()
+		getId("Oliver Hardy").Follow(actor_to_film).Out("<name>").Intersect(
+			getId("Mel Blanc").Follow(actor_to_film).Out("<name>")).All()
 			`,
 		expect: nil,
 	},
@@ -86,8 +87,8 @@ var benchmarkQueries = []struct {
 		message: "three huge sets with small intersection",
 		long:    true,
 		query: `
-			function getId(x) { return g.V(x).In("name") }
-			var actor_to_film = g.M().In("/film/performance/actor").In("/film/film/starring")
+			function getId(x) { return g.V(x).In("<name>") }
+			var actor_to_film = g.M().In("</film/performance/actor>").In("</film/film/starring>")
 
 			var a = getId("Oliver Hardy").Follow(actor_to_film).FollowR(actor_to_film)
 			var b = getId("Mel Blanc").Follow(actor_to_film).FollowR(actor_to_film)
@@ -103,8 +104,8 @@ var benchmarkQueries = []struct {
 			})
 			`,
 		expect: []interface{}{
-			map[string]string{"id": "/en/sterling_holloway"},
-			map[string]string{"id": "/en/billy_gilbert"},
+			map[string]string{"id": "</en/sterling_holloway>"},
+			map[string]string{"id": "</en/billy_gilbert>"},
 		},
 	},
 
@@ -115,7 +116,7 @@ var benchmarkQueries = []struct {
 		message: "the helpless checker",
 		long:    true,
 		query: `
-			g.V().As("person").In("name").In().In().Out("name").Is("Casablanca").All()
+			g.V().As("person").In("<name>").In().In().Out("<name>").Is("Casablanca").All()
 			`,
 		tag: "person",
 		expect: []interface{}{
@@ -142,7 +143,7 @@ var benchmarkQueries = []struct {
 		message: "the helpless checker, negated (films without Ingrid Bergman)",
 		long:    true,
 		query: `
-			g.V().As("person").In("name").In().In().Out("name").Except(g.V("Ingrid Bergman").In("name").In().In().Out("name")).Is("Casablanca").All()
+			g.V().As("person").In("<name>").In().In().Out("<name>").Except(g.V("Ingrid Bergman").In("<name>").In().In().Out("<name>")).Is("Casablanca").All()
 			`,
 		tag:    "person",
 		expect: nil,
@@ -151,7 +152,7 @@ var benchmarkQueries = []struct {
 		message: "the helpless checker, negated (without actors Ingrid Bergman)",
 		long:    true,
 		query: `
-			g.V().As("person").In("name").Except(g.V("Ingrid Bergman").In("name")).In().In().Out("name").Is("Casablanca").All()
+			g.V().As("person").In("<name>").Except(g.V("Ingrid Bergman").In("<name>")).In().In().Out("<name>").Is("Casablanca").All()
 			`,
 		tag: "person",
 		expect: []interface{}{
@@ -176,7 +177,7 @@ var benchmarkQueries = []struct {
 	//A: "Sandra Bullock"
 	{
 		message: "Net and Speed",
-		query: common + `m1_actors.Intersect(m2_actors).Out("name").All()
+		query: common + `m1_actors.Intersect(m2_actors).Out("<name>").All()
 `,
 		expect: []interface{}{
 			map[string]string{"id": "Sandra Bullock", "movie1": "The Net", "movie2": "Speed"},
@@ -187,7 +188,7 @@ var benchmarkQueries = []struct {
 	//A: No
 	{
 		message: "Keanu in The Net",
-		query: common + `actor2.Intersect(m1_actors).Out("name").All()
+		query: common + `actor2.Intersect(m1_actors).Out("<name>").All()
 `,
 		expect: nil,
 	},
@@ -196,7 +197,7 @@ var benchmarkQueries = []struct {
 	//A: Yes
 	{
 		message: "Keanu in Speed",
-		query: common + `actor2.Intersect(m2_actors).Out("name").All()
+		query: common + `actor2.Intersect(m2_actors).Out("<name>").All()
 `,
 		expect: []interface{}{
 			map[string]string{"id": "Keanu Reeves", "movie2": "Speed"},
@@ -209,7 +210,7 @@ var benchmarkQueries = []struct {
 	{
 		message: "Keanu with other in The Net",
 		long:    true,
-		query: common + `actor2.Follow(coStars1).Intersect(m1_actors).Out("name").All()
+		query: common + `actor2.Follow(coStars1).Intersect(m1_actors).Out("<name>").All()
 `,
 		expect: []interface{}{
 			map[string]string{"id": "Sandra Bullock", "movie1": "The Net", "costar1_movie": "Speed"},
@@ -223,7 +224,7 @@ var benchmarkQueries = []struct {
 	{
 		message: "Keanu and Bullock with other",
 		long:    true,
-		query: common + `actor1.Save("name","costar1_actor").Follow(coStars1).Intersect(actor2.Save("name","costar2_actor").Follow(coStars2)).Out("name").All()
+		query: common + `actor1.Save("<name>","costar1_actor").Follow(coStars1).Intersect(actor2.Save("<name>","costar2_actor").Follow(coStars2)).Out("<name>").All()
 `,
 		expect: []interface{}{
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Proposal", "costar2_actor": "Keanu Reeves", "costar2_movie": "Speed", "id": "Sandra Bullock"},
@@ -289,8 +290,8 @@ var benchmarkQueries = []struct {
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "The Replacements", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "Even Cowgirls Get the Blues", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "Youngblood", "id": "Keanu Reeves"},
-			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "Bill \u0026 Ted's Bogus Journey", "id": "Keanu Reeves"},
-			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "Bill \u0026 Ted's Excellent Adventure", "id": "Keanu Reeves"},
+			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "Bill & Ted's Bogus Journey", "id": "Keanu Reeves"},
+			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "Bill & Ted's Excellent Adventure", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "Johnny Mnemonic", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "The Devil's Advocate", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "Speed", "costar2_actor": "Keanu Reeves", "costar2_movie": "Thumbsucker", "id": "Keanu Reeves"},
@@ -347,8 +348,8 @@ var benchmarkQueries = []struct {
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "The Replacements", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "Even Cowgirls Get the Blues", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "Youngblood", "id": "Keanu Reeves"},
-			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "Bill \u0026 Ted's Bogus Journey", "id": "Keanu Reeves"},
-			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "Bill \u0026 Ted's Excellent Adventure", "id": "Keanu Reeves"},
+			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "Bill & Ted's Bogus Journey", "id": "Keanu Reeves"},
+			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "Bill & Ted's Excellent Adventure", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "Johnny Mnemonic", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "The Devil's Advocate", "id": "Keanu Reeves"},
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "The Lake House", "costar2_actor": "Keanu Reeves", "costar2_movie": "Thumbsucker", "id": "Keanu Reeves"},
@@ -394,44 +395,53 @@ var benchmarkQueries = []struct {
 			map[string]string{"costar1_actor": "Sandra Bullock", "costar1_movie": "In Love and War", "costar2_actor": "Keanu Reeves", "costar2_movie": "The Lake House", "id": "Sandra Bullock"},
 		},
 	},
+	{
+		message: "Save a number of predicates around a set of nodes",
+		query: `
+		g.V("_:9037", "_:49278", "_:44112", "_:44709", "_:43382").Save("</film/performance/character>", "char").Save("</film/performance/actor>", "act").SaveR("</film/film/starring>", "film").All()
+		`,
+		expect: []interface{}{
+			map[string]string{"act": "</en/humphrey_bogart>", "char": "Rick Blaine", "film": "</en/casablanca_1942>", "id": "_:9037"},
+			map[string]string{"act": "</en/humphrey_bogart>", "char": "Sam Spade", "film": "</en/the_maltese_falcon_1941>", "id": "_:49278"},
+			map[string]string{"act": "</en/humphrey_bogart>", "char": "Philip Marlowe", "film": "</en/the_big_sleep_1946>", "id": "_:44112"},
+			map[string]string{"act": "</en/humphrey_bogart>", "char": "Captain Queeg", "film": "</en/the_caine_mutiny_1954>", "id": "_:44709"},
+			map[string]string{"act": "</en/humphrey_bogart>", "char": "Charlie Allnut", "film": "</en/the_african_queen>", "id": "_:43382"},
+		},
+	},
 }
 
 const common = `
-var movie1 = g.V().Has("name", "The Net")
-var movie2 = g.V().Has("name", "Speed")
-var actor1 = g.V().Has("name", "Sandra Bullock")
-var actor2 = g.V().Has("name", "Keanu Reeves")
+var movie1 = g.V().Has("<name>", "The Net")
+var movie2 = g.V().Has("<name>", "Speed")
+var actor1 = g.V().Has("<name>", "Sandra Bullock")
+var actor2 = g.V().Has("<name>", "Keanu Reeves")
 
 // (film) -> starring -> (actor)
-var filmToActor = g.Morphism().Out("/film/film/starring").Out("/film/performance/actor")
+var filmToActor = g.Morphism().Out("</film/film/starring>").Out("</film/performance/actor>")
 
 // (actor) -> starring -> [film -> starring -> (actor)]
-var coStars1 = g.Morphism().In("/film/performance/actor").In("/film/film/starring").Save("name","costar1_movie").Follow(filmToActor)
-var coStars2 = g.Morphism().In("/film/performance/actor").In("/film/film/starring").Save("name","costar2_movie").Follow(filmToActor)
+var coStars1 = g.Morphism().In("</film/performance/actor>").In("</film/film/starring>").Save("<name>","costar1_movie").Follow(filmToActor)
+var coStars2 = g.Morphism().In("</film/performance/actor>").In("</film/film/starring>").Save("<name>","costar2_movie").Follow(filmToActor)
 
 // Stars for the movies "The Net" and "Speed"
-var m1_actors = movie1.Save("name","movie1").Follow(filmToActor)
-var m2_actors = movie2.Save("name","movie2").Follow(filmToActor)
+var m1_actors = movie1.Save("<name>","movie1").Follow(filmToActor)
+var m2_actors = movie2.Save("<name>","movie2").Follow(filmToActor)
 `
 
 var (
-	create            sync.Once
-	deleteAndRecreate sync.Once
-	cfg               = &config.Config{
+	cfg = &config.Config{
 		ReplicationType: "single",
 		Timeout:         300 * time.Second,
 	}
-
-	handle *graph.Handle
 )
 
-func prepare(t testing.TB) {
+func prepare(t testing.TB) *graph.Handle {
 	var remote bool
 	cfg.DatabaseType = *backend
 	switch *backend {
-	case "memstore":
+	case "memstore", "btree":
 		cfg.DatabasePath = "../data/30kmoviedata.nq.gz"
-	case "leveldb", "bolt":
+	case "leveldb", "bolt", "bolt2", "leveldb2":
 		cfg.DatabasePath = "/tmp/cayley_test_" + *backend
 		cfg.DatabaseOptions = map[string]interface{}{
 			"nosync": true, // It's a test. If we need to load, do it fast.
@@ -442,8 +452,11 @@ func prepare(t testing.TB) {
 			"database_name": "cayley_test", // provide a default test database
 		}
 		remote = true
-	case "sql":
+	case "sql", "postgres":
 		cfg.DatabasePath = "postgres://localhost/cayley_test"
+		cfg.DatabaseOptions = map[string]interface{}{
+			"flavor": *sqlFlavor,
+		}
 		remote = true
 	default:
 		t.Fatalf("Untestable backend store %s", *backend)
@@ -452,136 +465,118 @@ func prepare(t testing.TB) {
 		cfg.DatabasePath = *backendPath
 	}
 
-	var err error
-	create.Do(func() {
-		needsLoad := true
-		if graph.IsPersistent(cfg.DatabaseType) && !remote {
-			if _, err := os.Stat(cfg.DatabasePath); os.IsNotExist(err) {
-				err = db.Init(cfg)
-				if err != nil {
-					t.Fatalf("Could not initialize database: %v", err)
-				}
-			} else {
-				needsLoad = false
-			}
-		}
-
-		handle, err = db.Open(cfg)
-		if err != nil {
-			t.Fatalf("Failed to open %q: %v", cfg.DatabasePath, err)
-		}
-
-		if needsLoad && !remote {
-			err = internal.Load(handle.QuadWriter, cfg, "../data/30kmoviedata.nq.gz", "cquad")
+	needsLoad := true
+	if graph.IsPersistent(cfg.DatabaseType) && !remote {
+		if _, err := os.Stat(cfg.DatabasePath); os.IsNotExist(err) {
+			err = db.Init(cfg)
 			if err != nil {
-				t.Fatalf("Failed to load %q: %v", cfg.DatabasePath, err)
+				t.Fatalf("Could not initialize database: %v", err)
 			}
+		} else {
+			needsLoad = false
 		}
-	})
+	}
+
+	h, err := db.Open(cfg)
+	if err != nil {
+		t.Fatalf("Failed to open %q: %v", cfg.DatabasePath, err)
+	}
+
+	if needsLoad {
+		start := time.Now()
+		err := internal.Load(h.QuadWriter, cfg.LoadSize, "../data/30kmoviedata.nq.gz", format)
+		if err != nil {
+			t.Fatalf("Failed to load %q: %v", cfg.DatabasePath, err)
+		}
+		t.Logf("loaded data in %v", time.Since(start))
+	}
+	return h
 }
 
-func deletePrepare(t testing.TB) {
+func deletePrepare(t testing.TB) *graph.Handle {
 	var err error
-	deleteAndRecreate.Do(func() {
-		prepare(t)
-		if !graph.IsPersistent(cfg.DatabaseType) {
-			err = removeAll(handle.QuadWriter, cfg, "", "cquad")
-			if err != nil {
-				t.Fatalf("Failed to remove %q: %v", cfg.DatabasePath, err)
-			}
-			err = internal.Load(handle.QuadWriter, cfg, "", "cquad")
-			if err != nil {
-				t.Fatalf("Failed to load %q: %v", cfg.DatabasePath, err)
-			}
+	h := prepare(t)
+	if !graph.IsPersistent(cfg.DatabaseType) {
+		err = removeAll(h.QuadWriter, cfg, "", format)
+		if err != nil {
+			t.Fatalf("Failed to remove %q: %v", cfg.DatabasePath, err)
 		}
-	})
+		err = internal.Load(h.QuadWriter, cfg.LoadSize, "", format)
+		if err != nil {
+			t.Fatalf("Failed to load %q: %v", cfg.DatabasePath, err)
+		}
+	}
+	return h
 }
 
 func removeAll(qw graph.QuadWriter, cfg *config.Config, path, typ string) error {
-	return internal.DecompressAndLoad(qw, cfg, path, typ, remove)
-}
-
-func remove(qw graph.QuadWriter, cfg *config.Config, dec quad.Unmarshaler) error {
-	for {
-		t, err := dec.Unmarshal()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-		err = qw.RemoveQuad(t)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return internal.DecompressAndLoad(qw, cfg.LoadSize, path, typ, graph.NewRemover)
 }
 
 func TestQueries(t *testing.T) {
-	prepare(t)
-	checkQueries(t)
+	h := prepare(t)
+	defer h.Close()
+	checkQueries(t, h)
 }
 
 func TestDeletedAndRecreatedQueries(t *testing.T) {
 	if testing.Short() {
 		t.Skip()
 	}
-	deletePrepare(t)
-	checkQueries(t)
+	h := deletePrepare(t)
+	defer h.Close()
+	checkQueries(t, h)
 }
 
-func checkQueries(t *testing.T) {
+func checkQueries(t *testing.T, h *graph.Handle) {
+	if h == nil {
+		t.Fatal("not initialized")
+	}
 	for _, test := range benchmarkQueries {
-		if testing.Short() && test.long {
-			continue
-		}
-		if test.skip {
-			continue
-		}
-		tInit := time.Now()
-		t.Logf("Now testing %s ", test.message)
-		ses := gremlin.NewSession(handle.QuadStore, cfg.Timeout, true)
-		_, err := ses.Parse(test.query)
-		if err != nil {
-			t.Fatalf("Failed to parse benchmark gremlin %s: %v", test.message, err)
-		}
-		c := make(chan interface{}, 5)
-		go ses.Execute(test.query, c, 100)
-		var (
-			got      []interface{}
-			timedOut bool
-		)
-		for r := range c {
-			ses.Collate(r)
-			j, err := ses.Results()
-			if j == nil && err == nil {
-				continue
+		t.Run(test.message, func(t *testing.T) {
+			if testing.Short() && test.long {
+				t.SkipNow()
 			}
-			if err == gremlin.ErrKillTimeout {
-				timedOut = true
-				continue
+			if test.skip {
+				t.SkipNow()
 			}
-			got = append(got, j.([]interface{})...)
-		}
+			tInit := time.Now()
+			ses := gizmo.NewSession(h.QuadStore)
+			c := make(chan query.Result, 5)
+			ctx := context.Background()
+			if cfg.Timeout > 0 {
+				var cancel func()
+				ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
+				defer cancel()
+			}
+			go ses.Execute(ctx, test.query, c, 100)
+			var got []interface{}
+			for r := range c {
+				if err := r.Err(); err != nil {
+					t.Error("Error:", err)
+					continue
+				}
+				ses.Collate(r)
+				j, err := ses.Results()
+				if j == nil && err == nil {
+					continue
+				}
+				got = append(got, j.([]interface{})...)
+			}
+			t.Log(time.Since(tInit))
 
-		if timedOut {
-			t.Error("Query timed out: skipping validation.")
-			continue
-		}
-		t.Logf("(%v)\n", time.Since(tInit))
-
-		if len(got) != len(test.expect) {
-			t.Errorf("Unexpected number of results, got:%d expect:%d on %s.", len(got), len(test.expect), test.message)
-			continue
-		}
-		if unsortedEqual(got, test.expect) {
-			continue
-		}
-		t.Errorf("Unexpected results for %s:\n", test.message)
-		for i := range got {
-			t.Errorf("\n\tgot:%#v\n\texpect:%#v\n", got[i], test.expect[i])
-		}
+			if len(got) != len(test.expect) {
+				t.Errorf("Unexpected number of results, got:%d expect:%d on %s.", len(got), len(test.expect), test.message)
+				return
+			}
+			if unsortedEqual(got, test.expect) {
+				return
+			}
+			t.Errorf("Unexpected results for %s:\n", test.message)
+			for i := range got {
+				t.Errorf("\n\tgot:%#v\n\texpect:%#v\n", got[i], test.expect[i])
+			}
+		})
 	}
 }
 
@@ -594,76 +589,54 @@ func unsortedEqual(got, expect []interface{}) bool {
 func convertToStringList(in []interface{}) []string {
 	var out []string
 	for _, x := range in {
-		for k, v := range x.(map[string]string) {
-			out = append(out, fmt.Sprint(k, ":", v))
+		if xc, ok := x.(map[string]string); ok {
+			for k, v := range xc {
+				out = append(out, fmt.Sprint(k, ":", v))
+			}
+		} else {
+			for k, v := range x.(map[string]interface{}) {
+				out = append(out, fmt.Sprint(k, ":", v))
+			}
 		}
 	}
 	sort.Strings(out)
 	return out
 }
 
-func runBench(n int, b *testing.B) {
-	if testing.Short() && benchmarkQueries[n].long {
-		b.Skip()
+func BenchmarkQueries(b *testing.B) {
+	h := prepare(b)
+	defer h.Close()
+	for _, bench := range benchmarkQueries {
+		b.Run(bench.message, func(b *testing.B) {
+			if testing.Short() && bench.long {
+				b.Skip()
+			}
+			b.StopTimer()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				c := make(chan query.Result, 5)
+				ctx := context.Background()
+				var cancel func()
+				if cfg.Timeout > 0 {
+					ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
+				}
+				ses := gizmo.NewSession(h.QuadStore)
+				b.StartTimer()
+				go ses.Execute(ctx, bench.query, c, 100)
+				n := 0
+				for range c {
+					n++
+				}
+				b.StopTimer()
+				if n != len(bench.expect) {
+					b.Fatalf("unexpected number of results: %d vs %d", n, len(bench.expect))
+				}
+				if cancel != nil {
+					cancel()
+				}
+			}
+		})
 	}
-	prepare(b)
-	b.StopTimer()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		c := make(chan interface{}, 5)
-		ses := gremlin.NewSession(handle.QuadStore, cfg.Timeout, true)
-		// Do the parsing we know works.
-		ses.Parse(benchmarkQueries[n].query)
-		b.StartTimer()
-		go ses.Execute(benchmarkQueries[n].query, c, 100)
-		for _ = range c {
-		}
-		b.StopTimer()
-	}
-}
-
-func BenchmarkNamePredicate(b *testing.B) {
-	runBench(0, b)
-}
-
-func BenchmarkLargeSetsNoIntersection(b *testing.B) {
-	runBench(1, b)
-}
-
-func BenchmarkVeryLargeSetsSmallIntersection(b *testing.B) {
-	runBench(2, b)
-}
-
-func BenchmarkHelplessContainsChecker(b *testing.B) {
-	runBench(3, b)
-}
-
-func BenchmarkHelplessNotContainsFilms(b *testing.B) {
-	runBench(4, b)
-}
-
-func BenchmarkHelplessNotContainsActors(b *testing.B) {
-	runBench(5, b)
-}
-
-func BenchmarkNetAndSpeed(b *testing.B) {
-	runBench(6, b)
-}
-
-func BenchmarkKeanuAndNet(b *testing.B) {
-	runBench(7, b)
-}
-
-func BenchmarkKeanuAndSpeed(b *testing.B) {
-	runBench(8, b)
-}
-
-func BenchmarkKeanuOther(b *testing.B) {
-	runBench(9, b)
-}
-
-func BenchmarkKeanuBullockOther(b *testing.B) {
-	runBench(10, b)
 }
 
 // reader is a test helper to filter non-io.Reader methods from the contained io.Reader.

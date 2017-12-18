@@ -15,36 +15,40 @@
 package memstore
 
 import (
+	"fmt"
 	"io"
 	"math"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/graph/memstore/b"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
 )
 
+var _ graph.Iterator = &Iterator{}
+
 type Iterator struct {
-	uid    uint64
-	qs     *QuadStore
-	tags   graph.Tagger
-	tree   *b.Tree
-	iter   *b.Enumerator
-	data   string
-	result graph.Value
-	err    error
+	nodes bool
+	uid   uint64
+	qs    *QuadStore
+	tags  graph.Tagger
+	tree  *Tree
+
+	iter *Enumerator
+	cur  *primitive
+	err  error
+
+	d     quad.Direction
+	value int64
 }
 
-func NewIterator(tree *b.Tree, data string, qs *QuadStore) *Iterator {
-	iter, err := tree.SeekFirst()
-	if err != nil {
-		iter = nil
-	}
+func NewIterator(tree *Tree, qs *QuadStore, d quad.Direction, value int64) *Iterator {
 	return &Iterator{
-		uid:  iterator.NextUID(),
-		qs:   qs,
-		tree: tree,
-		iter: iter,
-		data: data,
+		nodes: d == 0,
+		uid:   iterator.NextUID(),
+		qs:    qs,
+		tree:  tree,
+		d:     d,
+		value: value,
 	}
 }
 
@@ -53,11 +57,9 @@ func (it *Iterator) UID() uint64 {
 }
 
 func (it *Iterator) Reset() {
-	var err error
-	it.iter, err = it.tree.SeekFirst()
-	if err != nil {
-		it.iter = nil
-	}
+	it.iter = nil
+	it.err = nil
+	it.cur = nil
 }
 
 func (it *Iterator) Tagger() *graph.Tagger {
@@ -65,40 +67,12 @@ func (it *Iterator) Tagger() *graph.Tagger {
 }
 
 func (it *Iterator) TagResults(dst map[string]graph.Value) {
-	for _, tag := range it.tags.Tags() {
-		dst[tag] = it.Result()
-	}
-
-	for tag, value := range it.tags.Fixed() {
-		dst[tag] = value
-	}
+	it.tags.TagResult(dst, it.Result())
 }
 
 func (it *Iterator) Clone() graph.Iterator {
-	var iter *b.Enumerator
-	if it.result != nil {
-		var ok bool
-		iter, ok = it.tree.Seek(it.result.(int64))
-		if !ok {
-			panic("value unexpectedly missing")
-		}
-	} else {
-		var err error
-		iter, err = it.tree.SeekFirst()
-		if err != nil {
-			iter = nil
-		}
-	}
-
-	m := &Iterator{
-		uid:  iterator.NextUID(),
-		qs:   it.qs,
-		tree: it.tree,
-		iter: iter,
-		data: it.data,
-	}
+	m := NewIterator(it.tree, it.qs, it.d, it.value)
 	m.tags.CopyFrom(it)
-
 	return m
 }
 
@@ -106,28 +80,28 @@ func (it *Iterator) Close() error {
 	return nil
 }
 
-func (it *Iterator) checkValid(index int64) bool {
-	return it.qs.log[index].DeletedBy == 0
-}
-
 func (it *Iterator) Next() bool {
 	graph.NextLogIn(it)
-
 	if it.iter == nil {
-		return graph.NextLogOut(it, nil, false)
-	}
-	result, _, err := it.iter.Next()
-	if err != nil {
-		if err != io.EOF {
-			it.err = err
+		it.iter, it.err = it.tree.SeekFirst()
+		if it.err == io.EOF || it.iter == nil {
+			it.err = nil
+			return graph.NextLogOut(it, false)
+		} else if it.err != nil {
+			return graph.NextLogOut(it, false)
 		}
-		return graph.NextLogOut(it, nil, false)
 	}
-	if !it.checkValid(result) {
-		return it.Next()
+	for {
+		_, p, err := it.iter.Next()
+		if err != nil {
+			if err != io.EOF {
+				it.err = err
+			}
+			return graph.NextLogOut(it, false)
+		}
+		it.cur = p
+		return graph.NextLogOut(it, true)
 	}
-	it.result = result
-	return graph.NextLogOut(it, it.result, true)
 }
 
 func (it *Iterator) Err() error {
@@ -135,7 +109,10 @@ func (it *Iterator) Err() error {
 }
 
 func (it *Iterator) Result() graph.Value {
-	return it.result
+	if it.cur == nil {
+		return nil
+	}
+	return qprim{p: it.cur}
 }
 
 func (it *Iterator) NextPath() bool {
@@ -153,33 +130,29 @@ func (it *Iterator) Size() (int64, bool) {
 
 func (it *Iterator) Contains(v graph.Value) bool {
 	graph.ContainsLogIn(it, v)
-	if _, ok := it.tree.Get(v.(int64)); ok {
-		it.result = v
-		return graph.ContainsLogOut(it, v, true)
+	if v == nil {
+		return graph.ContainsLogOut(it, v, false)
+	}
+	switch v := v.(type) {
+	case bnode:
+		if p, ok := it.tree.Get(int64(v)); ok {
+			it.cur = p
+			return graph.ContainsLogOut(it, v, true)
+		}
+	case qprim:
+		if v.p.Quad.Dir(it.d) == it.value {
+			it.cur = v.p
+			return graph.ContainsLogOut(it, v, true)
+		}
 	}
 	return graph.ContainsLogOut(it, v, false)
 }
 
-func (it *Iterator) Describe() graph.Description {
-	size, _ := it.Size()
-	return graph.Description{
-		UID:  it.UID(),
-		Name: it.data,
-		Type: it.Type(),
-		Tags: it.tags.Tags(),
-		Size: size,
-	}
+func (it *Iterator) String() string {
+	return fmt.Sprintf("MemStore(%v)", it.d)
 }
 
-var memType graph.Type
-
-func init() {
-	memType = graph.RegisterIterator("b+tree")
-}
-
-func Type() graph.Type { return memType }
-
-func (it *Iterator) Type() graph.Type { return memType }
+func (it *Iterator) Type() graph.Type { return "b+tree" }
 
 func (it *Iterator) Sorted() bool { return true }
 
@@ -192,7 +165,6 @@ func (it *Iterator) Stats() graph.IteratorStats {
 		ContainsCost: int64(math.Log(float64(it.tree.Len()))) + 1,
 		NextCost:     1,
 		Size:         int64(it.tree.Len()),
+		ExactSize:    true,
 	}
 }
-
-var _ graph.Nexter = &Iterator{}

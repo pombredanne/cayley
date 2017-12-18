@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// +build !appengine
+
 package db
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -25,13 +28,10 @@ import (
 
 	"github.com/peterh/liner"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/internal/config"
-	"github.com/google/cayley/quad/cquads"
-	"github.com/google/cayley/query"
-	"github.com/google/cayley/query/gremlin"
-	"github.com/google/cayley/query/mql"
-	"github.com/google/cayley/query/sexp"
+	"github.com/cayleygraph/cayley/clog"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/quad/nquads"
+	"github.com/cayleygraph/cayley/query"
 )
 
 func trace(s string) (string, time.Time) {
@@ -44,7 +44,7 @@ func un(s string, startTime time.Time) {
 	fmt.Printf(s, float64(endTime.UnixNano()-startTime.UnixNano())/float64(1E6))
 }
 
-func Run(query string, ses query.Session) {
+func Run(ctx context.Context, qu string, ses query.REPLSession) error {
 	nResults := 0
 	startTrace, startTime := trace("Elapsed time: %g ms\n\n")
 	defer func() {
@@ -53,10 +53,13 @@ func Run(query string, ses query.Session) {
 		}
 	}()
 	fmt.Printf("\n")
-	c := make(chan interface{}, 5)
-	go ses.Execute(query, c, 100)
+	c := make(chan query.Result, 5)
+	go ses.Execute(ctx, qu, c, 100)
 	for res := range c {
-		fmt.Print(ses.Format(res))
+		if err := res.Err(); err != nil {
+			return err
+		}
+		fmt.Print(ses.FormatREPL(res))
 		nResults++
 	}
 	if nResults > 0 {
@@ -66,27 +69,27 @@ func Run(query string, ses query.Session) {
 		}
 		fmt.Printf("-----------\n%d %s\n", nResults, results)
 	}
+	return nil
 }
 
 const (
+	defaultLanguage = "gizmo"
+
 	ps1 = "cayley> "
 	ps2 = "...     "
 
 	history = ".cayley_history"
 )
 
-func Repl(h *graph.Handle, queryLanguage string, cfg *config.Config) error {
-	var ses query.Session
-	switch queryLanguage {
-	case "sexp":
-		ses = sexp.NewSession(h.QuadStore)
-	case "mql":
-		ses = mql.NewSession(h.QuadStore)
-	case "gremlin":
-		fallthrough
-	default:
-		ses = gremlin.NewSession(h.QuadStore, cfg.Timeout, true)
+func Repl(ctx context.Context, h *graph.Handle, queryLanguage string, timeout time.Duration) error {
+	if queryLanguage == "" {
+		queryLanguage = defaultLanguage
 	}
+	l := query.GetLanguage(queryLanguage)
+	if l == nil || l.REPL == nil {
+		return fmt.Errorf("unsupported query language: %q", queryLanguage)
+	}
+	ses := l.REPL(h.QuadStore)
 
 	term, err := terminal(history)
 	if os.IsNotExist(err) {
@@ -100,7 +103,17 @@ func Repl(h *graph.Handle, queryLanguage string, cfg *config.Config) error {
 		code string
 	)
 
+	newCtx := func() (context.Context, func()) { return ctx, func() {} }
+	if timeout > 0 {
+		newCtx = func() (context.Context, func()) { return context.WithTimeout(ctx, timeout) }
+	}
+
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if len(code) == 0 {
 			prompt = ps1
 		} else {
@@ -141,22 +154,27 @@ func Repl(h *graph.Handle, queryLanguage string, cfg *config.Config) error {
 						continue
 					}
 				}
-				ses.Debug(debug)
+				if debug {
+					clog.SetV(2)
+				} else {
+					clog.SetV(0)
+				}
 				fmt.Printf("Debug set to %t\n", debug)
 				continue
 
 			case ":a":
-				quad, err := cquads.Parse(args)
+				quad, err := nquads.Parse(args)
+				if err == nil {
+					err = h.QuadWriter.AddQuad(quad)
+				}
 				if err != nil {
 					fmt.Printf("Error: not a valid quad: %v\n", err)
 					continue
 				}
-
-				h.QuadWriter.AddQuad(quad)
 				continue
 
 			case ":d":
-				quad, err := cquads.Parse(args)
+				quad, err := nquads.Parse(args)
 				if err != nil {
 					fmt.Printf("Error: not a valid quad: %v\n", err)
 					continue
@@ -165,6 +183,10 @@ func Repl(h *graph.Handle, queryLanguage string, cfg *config.Config) error {
 				if err != nil {
 					fmt.Printf("error deleting: %v\n", err)
 				}
+				continue
+
+			case "help":
+				fmt.Printf("Help\n\texit // Exit\n\thelp // this help\n\td: <quad> // delete quad\n\ta: <quad> // add quad\n\t:debug [t|f]\n")
 				continue
 
 			case "exit":
@@ -181,15 +203,16 @@ func Repl(h *graph.Handle, queryLanguage string, cfg *config.Config) error {
 
 		code += line
 
-		result, err := ses.Parse(code)
-		switch result {
-		case query.Parsed:
-			Run(code, ses)
-			code = ""
-		case query.ParseFail:
+		nctx, cancel := newCtx()
+		err = Run(nctx, code, ses)
+		cancel()
+		if err == query.ErrParseMore {
+			// collect more input
+		} else if err != nil {
 			fmt.Println("Error: ", err)
 			code = ""
-		case query.ParseMore:
+		} else {
+			code = ""
 		}
 	}
 }

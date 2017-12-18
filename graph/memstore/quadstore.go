@@ -15,16 +15,13 @@
 package memstore
 
 import (
-	"errors"
 	"fmt"
-	"time"
+	"strconv"
+	"strings"
 
-	"github.com/barakmich/glog"
-
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/graph/memstore/b"
-	"github.com/google/cayley/quad"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
 )
 
 const QuadStoreType = "memstore"
@@ -34,43 +31,54 @@ func init() {
 		NewFunc: func(string, graph.Options) (graph.QuadStore, error) {
 			return newQuadStore(), nil
 		},
-		NewForRequestFunc: nil,
-		UpgradeFunc:       nil,
-		InitFunc:          nil,
-		IsPersistent:      false,
+		UpgradeFunc:  nil,
+		InitFunc:     nil,
+		IsPersistent: false,
 	})
 }
+
+type bnode int64
+
+func (n bnode) Key() interface{} { return n }
+
+type qprim struct {
+	p *primitive
+}
+
+func (n qprim) Key() interface{} { return n.p.ID }
+
+var _ quad.Writer = (*QuadStore)(nil)
 
 func cmp(a, b int64) int {
 	return int(a - b)
 }
 
 type QuadDirectionIndex struct {
-	index [4]map[int64]*b.Tree
+	index [4]map[int64]*Tree
 }
 
 func NewQuadDirectionIndex() QuadDirectionIndex {
-	return QuadDirectionIndex{[...]map[int64]*b.Tree{
-		quad.Subject - 1:   make(map[int64]*b.Tree),
-		quad.Predicate - 1: make(map[int64]*b.Tree),
-		quad.Object - 1:    make(map[int64]*b.Tree),
-		quad.Label - 1:     make(map[int64]*b.Tree),
+	return QuadDirectionIndex{[...]map[int64]*Tree{
+		quad.Subject - 1:   make(map[int64]*Tree),
+		quad.Predicate - 1: make(map[int64]*Tree),
+		quad.Object - 1:    make(map[int64]*Tree),
+		quad.Label - 1:     make(map[int64]*Tree),
 	}}
 }
 
-func (qdi QuadDirectionIndex) Tree(d quad.Direction, id int64) *b.Tree {
+func (qdi QuadDirectionIndex) Tree(d quad.Direction, id int64) *Tree {
 	if d < quad.Subject || d > quad.Label {
 		panic("illegal direction")
 	}
 	tree, ok := qdi.index[d-1][id]
 	if !ok {
-		tree = b.TreeNew(cmp)
+		tree = TreeNew(cmp)
 		qdi.index[d-1][id] = tree
 	}
 	return tree
 }
 
-func (qdi QuadDirectionIndex) Get(d quad.Direction, id int64) (*b.Tree, bool) {
+func (qdi QuadDirectionIndex) Get(d quad.Direction, id int64) (*Tree, bool) {
 	if d < quad.Subject || d > quad.Label {
 		panic("illegal direction")
 	}
@@ -78,211 +86,363 @@ func (qdi QuadDirectionIndex) Get(d quad.Direction, id int64) (*b.Tree, bool) {
 	return tree, ok
 }
 
-type LogEntry struct {
-	ID        int64
-	Quad      quad.Quad
-	Action    graph.Procedure
-	Timestamp time.Time
-	DeletedBy int64
+type primitive struct {
+	ID    int64
+	Quad  internalQuad
+	Value quad.Value
+}
+
+type internalQuad struct {
+	S, P, O, L int64
+}
+
+func (q internalQuad) Zero() bool {
+	return q == (internalQuad{})
+}
+
+func (q *internalQuad) SetDir(d quad.Direction, n int64) {
+	switch d {
+	case quad.Subject:
+		q.S = n
+	case quad.Predicate:
+		q.P = n
+	case quad.Object:
+		q.O = n
+	case quad.Label:
+		q.L = n
+	default:
+		panic(fmt.Errorf("unknown dir: %v", d))
+	}
+}
+func (q internalQuad) Dir(d quad.Direction) int64 {
+	var n int64
+	switch d {
+	case quad.Subject:
+		n = q.S
+	case quad.Predicate:
+		n = q.P
+	case quad.Object:
+		n = q.O
+	case quad.Label:
+		n = q.L
+	}
+	return n
 }
 
 type QuadStore struct {
-	nextID     int64
-	nextQuadID int64
-	idMap      map[string]int64
-	revIDMap   map[int64]string
-	log        []LogEntry
-	size       int64
-	index      QuadDirectionIndex
+	last int64
+	// TODO: string -> quad.Value once Raw -> typed resolution is unnecessary
+	vals    map[string]int64
+	quads   map[internalQuad]int64
+	prim    map[int64]*primitive
+	all     []*primitive // might not be sorted by id
+	index   QuadDirectionIndex
+	horizon int64 // used only to assign ids to tx
 	// vip_index map[string]map[int64]map[string]map[int64]*b.Tree
+}
+
+// New creates a new in-memory quad store and loads provided quads.
+func New(quads ...quad.Quad) *QuadStore {
+	qs := newQuadStore()
+	for _, q := range quads {
+		qs.AddQuad(q)
+	}
+	return qs
 }
 
 func newQuadStore() *QuadStore {
 	return &QuadStore{
-		idMap:    make(map[string]int64),
-		revIDMap: make(map[int64]string),
-
-		// Sentinel null entry so indices start at 1
-		log: make([]LogEntry, 1, 200),
-
-		index:      NewQuadDirectionIndex(),
-		nextID:     1,
-		nextQuadID: 1,
+		vals:  make(map[string]int64),
+		quads: make(map[internalQuad]int64),
+		prim:  make(map[int64]*primitive),
+		index: NewQuadDirectionIndex(),
 	}
+}
+
+func (qs *QuadStore) addPrimitive(p *primitive) int64 {
+	qs.last++
+	id := qs.last
+	p.ID = id
+	qs.appendPrimitive(p)
+	return id
+}
+
+func (qs *QuadStore) appendPrimitive(p *primitive) {
+	qs.prim[p.ID] = p
+	qs.all = append(qs.all, p)
+}
+
+const internalBNodePrefix = "memnode"
+
+func (qs *QuadStore) resolveVal(v quad.Value, add bool) (int64, bool) {
+	if v == nil {
+		return 0, false
+	}
+	if n, ok := v.(quad.BNode); ok && strings.HasPrefix(string(n), internalBNodePrefix) {
+		n = n[len(internalBNodePrefix):]
+		id, err := strconv.ParseInt(string(n), 10, 64)
+		if err == nil && id != 0 {
+			_, ok := qs.prim[id]
+			if ok || !add {
+				return id, ok
+			}
+			qs.appendPrimitive(&primitive{ID: id})
+			return id, true
+		}
+	}
+	vs := v.String()
+	if id, exists := qs.vals[vs]; exists || !add {
+		return id, exists
+	}
+	id := qs.addPrimitive(&primitive{Value: v})
+	qs.vals[vs] = id
+	return id, true
+}
+
+func (qs *QuadStore) resolveQuad(q quad.Quad, add bool) (internalQuad, bool) {
+	var p internalQuad
+	for dir := quad.Subject; dir <= quad.Label; dir++ {
+		v := q.Get(dir)
+		if v == nil {
+			continue
+		}
+		if vid, _ := qs.resolveVal(v, add); vid != 0 {
+			p.SetDir(dir, vid)
+		} else if !add {
+			return internalQuad{}, false
+		}
+	}
+	return p, true
+}
+
+func (qs *QuadStore) lookupVal(id int64) quad.Value {
+	pv := qs.prim[id]
+	if pv == nil || pv.Value == nil {
+		return quad.BNode(internalBNodePrefix + strconv.FormatInt(id, 10))
+	}
+	return pv.Value
+}
+
+func (qs *QuadStore) lookupQuadDirs(p internalQuad) quad.Quad {
+	var q quad.Quad
+	for dir := quad.Subject; dir <= quad.Label; dir++ {
+		vid := p.Dir(dir)
+		if vid == 0 {
+			continue
+		}
+		v := qs.lookupVal(vid)
+		q.Set(dir, v)
+	}
+	return q
+}
+
+// AddNode adds a blank node (with no value) to quad store. It returns an id of the node.
+func (qs *QuadStore) AddBNode() int64 {
+	return qs.addPrimitive(&primitive{})
+}
+
+// AddNode adds a value to quad store. It returns an id of the value.
+// False is returned as a second parameter if value exists already.
+func (qs *QuadStore) AddValue(v quad.Value) (int64, bool) {
+	id, exists := qs.resolveVal(v, true)
+	return id, !exists
+}
+
+func (qs *QuadStore) indexesForQuad(q internalQuad) []*Tree {
+	trees := make([]*Tree, 0, 4)
+	for dir := quad.Subject; dir <= quad.Label; dir++ {
+		v := q.Dir(dir)
+		if v == 0 {
+			continue
+		}
+		trees = append(trees, qs.index.Tree(dir, v))
+	}
+	return trees
+}
+
+// AddQuad adds a quad to quad store. It returns an id of the quad.
+// False is returned as a second parameter if quad exists already.
+func (qs *QuadStore) AddQuad(q quad.Quad) (int64, bool) {
+	p, _ := qs.resolveQuad(q, true)
+	if id := qs.quads[p]; id != 0 {
+		return id, false
+	}
+	pr := &primitive{Quad: p}
+	id := qs.addPrimitive(pr)
+	qs.quads[p] = id
+	for _, t := range qs.indexesForQuad(p) {
+		t.Set(id, pr)
+	}
+	// TODO(barakmich): Add VIP indexing
+	return id, true
+}
+
+// WriteQuad adds a quad to quad store.
+//
+// Deprecated: use AddQuad instead.
+func (qs *QuadStore) WriteQuad(q quad.Quad) error {
+	qs.AddQuad(q)
+	return nil
+}
+
+func (qs *QuadStore) Delete(id int64) bool {
+	p := qs.prim[id]
+	if p == nil {
+		return false
+	}
+	// remove from value index
+	if p.Value != nil {
+		delete(qs.vals, p.Value.String())
+	}
+	// remove from quad indexes
+	for _, t := range qs.indexesForQuad(p.Quad) {
+		t.Delete(id)
+	}
+	delete(qs.quads, p.Quad)
+	// remove primitive
+	delete(qs.prim, id)
+	for i, p2 := range qs.all {
+		if p == p2 {
+			qs.all = append(qs.all[:i], qs.all[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
+func (qs *QuadStore) findQuad(q quad.Quad) (int64, internalQuad, bool) {
+	p, ok := qs.resolveQuad(q, false)
+	if !ok {
+		return 0, p, false
+	}
+	id := qs.quads[p]
+	return id, p, id != 0
 }
 
 func (qs *QuadStore) ApplyDeltas(deltas []graph.Delta, ignoreOpts graph.IgnoreOpts) error {
-	// Precheck the whole transaction
+	// Precheck the whole transaction (if required)
+	if !ignoreOpts.IgnoreDup || !ignoreOpts.IgnoreMissing {
+		for _, d := range deltas {
+			switch d.Action {
+			case graph.Add:
+				if !ignoreOpts.IgnoreDup {
+					if _, _, ok := qs.findQuad(d.Quad); ok {
+						return &graph.DeltaError{Delta: d, Err: graph.ErrQuadExists}
+					}
+				}
+			case graph.Delete:
+				if !ignoreOpts.IgnoreMissing {
+					if _, _, ok := qs.findQuad(d.Quad); !ok {
+						return &graph.DeltaError{Delta: d, Err: graph.ErrQuadNotExist}
+					}
+				}
+			default:
+				return &graph.DeltaError{Delta: d, Err: graph.ErrInvalidAction}
+			}
+		}
+	}
+
 	for _, d := range deltas {
 		switch d.Action {
 		case graph.Add:
-			if !ignoreOpts.IgnoreDup {
-				if _, exists := qs.indexOf(d.Quad); exists {
-					return graph.ErrQuadExists
-				}
-			}
+			qs.AddQuad(d.Quad)
 		case graph.Delete:
-			if !ignoreOpts.IgnoreMissing {
-				if _, exists := qs.indexOf(d.Quad); !exists {
-					return graph.ErrQuadNotExist
-				}
+			if id, _, ok := qs.findQuad(d.Quad); ok {
+				qs.Delete(id)
 			}
 		default:
-			return errors.New("memstore: invalid action")
+			// TODO: ideally we should rollback it
+			return &graph.DeltaError{Delta: d, Err: graph.ErrInvalidAction}
 		}
 	}
-
-	for _, d := range deltas {
-		var err error
-		switch d.Action {
-		case graph.Add:
-			err = qs.AddDelta(d)
-			if err != nil && ignoreOpts.IgnoreDup {
-				err = nil
-			}
-		case graph.Delete:
-			err = qs.RemoveDelta(d)
-			if err != nil && ignoreOpts.IgnoreMissing {
-				err = nil
-			}
-		default:
-			panic("memstore: unexpected invalid action")
-		}
-		if err != nil {
-			return err
-		}
-	}
+	qs.horizon++
 	return nil
 }
 
-const maxInt = int(^uint(0) >> 1)
-
-func (qs *QuadStore) indexOf(t quad.Quad) (int64, bool) {
-	min := maxInt
-	var tree *b.Tree
-	for d := quad.Subject; d <= quad.Label; d++ {
-		sid := t.Get(d)
-		if d == quad.Label && sid == "" {
-			continue
-		}
-		id, ok := qs.idMap[sid]
-		// If we've never heard about a node, it must not exist
-		if !ok {
-			return 0, false
-		}
-		index, ok := qs.index.Get(d, id)
-		if !ok {
-			// If it's never been indexed in this direction, it can't exist.
-			return 0, false
-		}
-		if l := index.Len(); l < min {
-			min, tree = l, index
-		}
+func asID(v graph.Value) (int64, bool) {
+	switch v := v.(type) {
+	case bnode:
+		return int64(v), true
+	case qprim:
+		return v.p.ID, true
+	default:
+		return 0, false
 	}
-	it := NewIterator(tree, "", qs)
-
-	for it.Next() {
-		val := it.Result()
-		if t == qs.log[val.(int64)].Quad {
-			return val.(int64), true
-		}
-	}
-	return 0, false
 }
 
-func (qs *QuadStore) AddDelta(d graph.Delta) error {
-	if _, exists := qs.indexOf(d.Quad); exists {
-		return graph.ErrQuadExists
-	}
-	qid := qs.nextQuadID
-	qs.log = append(qs.log, LogEntry{
-		ID:        d.ID.Int(),
-		Quad:      d.Quad,
-		Action:    d.Action,
-		Timestamp: d.Timestamp})
-	qs.size++
-	qs.nextQuadID++
-
-	for dir := quad.Subject; dir <= quad.Label; dir++ {
-		sid := d.Quad.Get(dir)
-		if dir == quad.Label && sid == "" {
-			continue
+func (qs *QuadStore) quad(v graph.Value) (q internalQuad, ok bool) {
+	switch v := v.(type) {
+	case bnode:
+		p := qs.prim[int64(v)]
+		if p == nil {
+			return
 		}
-		if _, ok := qs.idMap[sid]; !ok {
-			qs.idMap[sid] = qs.nextID
-			qs.revIDMap[qs.nextID] = sid
-			qs.nextID++
-		}
-		id := qs.idMap[sid]
-		tree := qs.index.Tree(dir, id)
-		tree.Set(qid, struct{}{})
+		q = p.Quad
+	case qprim:
+		q = v.p.Quad
+	default:
+		return internalQuad{}, false
 	}
-
-	// TODO(barakmich): Add VIP indexing
-	return nil
-}
-
-func (qs *QuadStore) RemoveDelta(d graph.Delta) error {
-	prevQuadID, exists := qs.indexOf(d.Quad)
-	if !exists {
-		return graph.ErrQuadNotExist
-	}
-
-	quadID := qs.nextQuadID
-	qs.log = append(qs.log, LogEntry{
-		ID:        d.ID.Int(),
-		Quad:      d.Quad,
-		Action:    d.Action,
-		Timestamp: d.Timestamp})
-	qs.log[prevQuadID].DeletedBy = quadID
-	qs.size--
-	qs.nextQuadID++
-	return nil
+	return q, !q.Zero()
 }
 
 func (qs *QuadStore) Quad(index graph.Value) quad.Quad {
-	return qs.log[index.(int64)].Quad
+	q, ok := qs.quad(index)
+	if !ok {
+		return quad.Quad{}
+	}
+	return qs.lookupQuadDirs(q)
 }
 
 func (qs *QuadStore) QuadIterator(d quad.Direction, value graph.Value) graph.Iterator {
-	index, ok := qs.index.Get(d, value.(int64))
-	data := fmt.Sprintf("dir:%s val:%d", d, value.(int64))
-	if ok {
-		return NewIterator(index, data, qs)
+	id, ok := asID(value)
+	if !ok {
+		return iterator.NewNull()
 	}
-	return &iterator.Null{}
+	index, ok := qs.index.Get(d, id)
+	if ok && index.Len() != 0 {
+		return NewIterator(index, qs, d, id)
+	}
+	return iterator.NewNull()
 }
 
 func (qs *QuadStore) Horizon() graph.PrimaryKey {
-	return graph.NewSequentialKey(qs.log[len(qs.log)-1].ID)
+	return graph.NewSequentialKey(qs.horizon)
 }
 
 func (qs *QuadStore) Size() int64 {
-	return qs.size
+	return int64(len(qs.prim))
 }
 
-func (qs *QuadStore) DebugPrint() {
-	for i, l := range qs.log {
-		if i == 0 {
-			continue
-		}
-		glog.V(2).Infof("%d: %#v", i, l)
+func (qs *QuadStore) ValueOf(name quad.Value) graph.Value {
+	if name == nil {
+		return nil
 	}
-}
-
-func (qs *QuadStore) ValueOf(name string) graph.Value {
-	return qs.idMap[name]
-}
-
-func (qs *QuadStore) NameOf(id graph.Value) string {
-	if id == nil {
-		return ""
+	id := qs.vals[name.String()]
+	if id == 0 {
+		return nil
 	}
-	return qs.revIDMap[id.(int64)]
+	return bnode(id)
+}
+
+func (qs *QuadStore) NameOf(v graph.Value) quad.Value {
+	if v == nil {
+		return nil
+	} else if v, ok := v.(graph.PreFetchedValue); ok {
+		return v.NameOf()
+	}
+	n, ok := asID(v)
+	if !ok {
+		return nil
+	}
+	if _, ok = qs.prim[n]; !ok {
+		return nil
+	}
+	return qs.lookupVal(n)
 }
 
 func (qs *QuadStore) QuadsAllIterator() graph.Iterator {
-	return newQuadsAllIterator(qs)
+	return newAllIterator(qs, false, qs.last)
 }
 
 func (qs *QuadStore) FixedIterator() graph.FixedIterator {
@@ -290,16 +450,19 @@ func (qs *QuadStore) FixedIterator() graph.FixedIterator {
 }
 
 func (qs *QuadStore) QuadDirection(val graph.Value, d quad.Direction) graph.Value {
-	name := qs.Quad(val).Get(d)
-	return qs.ValueOf(name)
+	q, ok := qs.quad(val)
+	if !ok {
+		return nil
+	}
+	id := q.Dir(d)
+	if id == 0 {
+		return nil
+	}
+	return bnode(id)
 }
 
 func (qs *QuadStore) NodesAllIterator() graph.Iterator {
-	return newNodesAllIterator(qs)
+	return newAllIterator(qs, true, qs.last)
 }
 
-func (qs *QuadStore) Close() {}
-
-func (qs *QuadStore) Type() string {
-	return QuadStoreType
-}
+func (qs *QuadStore) Close() error { return nil }

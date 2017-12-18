@@ -14,21 +14,28 @@
 
 package path
 
-import "github.com/google/cayley/graph"
+import (
+	"context"
+	"regexp"
 
-type applyMorphism func(graph.QuadStore, graph.Iterator, *context) (graph.Iterator, *context)
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/graph/shape"
+	"github.com/cayleygraph/cayley/quad"
+)
+
+type applyMorphism func(shape.Shape, *pathContext) (shape.Shape, *pathContext)
 
 type morphism struct {
-	Name     string
-	Reversal func(*context) (morphism, *context)
+	IsTag    bool
+	Reversal func(*pathContext) (morphism, *pathContext)
 	Apply    applyMorphism
 	tags     []string
-	context  context
 }
 
-// context allows a high-level change to the way paths are constructed. Some
+// pathContext allows a high-level change to the way paths are constructed. Some
 // functions may change the context, causing following chained calls to act
-// cdifferently.
+// differently.
 //
 // In a sense, this is a global state which can be changed as the path
 // continues. And as with dealing with any global state, care should be taken:
@@ -42,13 +49,21 @@ type morphism struct {
 // then yield a pointer to their own member context as the return value.
 //
 // For more examples, look at the morphisms which claim the individual fields.
-type context struct {
+type pathContext struct {
+	// TODO(dennwc): replace with net/context?
+
 	// Represents the path to the limiting set of labels that should be considered under traversal.
 	// inMorphism, outMorphism, et al should constrain edges by this set.
 	// A nil in this field represents all labels.
 	//
 	// Claimed by the withLabel morphism
-	labelSet *Path
+	labelSet shape.Shape
+}
+
+func (c pathContext) copy() pathContext {
+	return pathContext{
+		labelSet: c.labelSet,
+	}
 }
 
 // Path represents either a morphism (a pre-defined path stored for later use),
@@ -56,22 +71,32 @@ type context struct {
 type Path struct {
 	stack       []morphism
 	qs          graph.QuadStore // Optionally. A nil qs is equivalent to a morphism.
-	baseContext context
+	baseContext pathContext
 }
 
 // IsMorphism returns whether this Path is a morphism.
 func (p *Path) IsMorphism() bool { return p.qs == nil }
 
 // StartMorphism creates a new Path with no underlying QuadStore.
-func StartMorphism(nodes ...string) *Path {
+func StartMorphism(nodes ...quad.Value) *Path {
 	return StartPath(nil, nodes...)
 }
 
 // StartPath creates a new Path from a set of nodes and an underlying QuadStore.
-func StartPath(qs graph.QuadStore, nodes ...string) *Path {
+func StartPath(qs graph.QuadStore, nodes ...quad.Value) *Path {
 	return &Path{
 		stack: []morphism{
 			isMorphism(nodes...),
+		},
+		qs: qs,
+	}
+}
+
+// StartPathNodes creates a new Path from a set of nodes and an underlying QuadStore.
+func StartPathNodes(qs graph.QuadStore, nodes ...graph.Value) *Path {
+	return &Path{
+		stack: []morphism{
+			isNodeMorphism(nodes...),
 		},
 		qs: qs,
 	}
@@ -93,6 +118,28 @@ func NewPath(qs graph.QuadStore) *Path {
 	}
 }
 
+// Clone returns a clone of the current path.
+func (p *Path) Clone() *Path {
+	stack := p.stack
+	return &Path{
+		stack:       stack[:len(stack):len(stack)],
+		qs:          p.qs,
+		baseContext: p.baseContext,
+	}
+}
+
+// Unexported clone method returns a *Path with a copy of the original stack,
+// with assumption that the new stack will be appended to.
+func (p *Path) clone() *Path {
+	stack := p.stack
+	p.stack = stack[:len(stack):len(stack)]
+	return &Path{
+		stack:       stack,
+		qs:          p.qs,
+		baseContext: p.baseContext,
+	}
+}
+
 // Reverse returns a new Path that is the reverse of the current one.
 func (p *Path) Reverse() *Path {
 	newPath := NewPath(p.qs)
@@ -107,16 +154,53 @@ func (p *Path) Reverse() *Path {
 
 // Is declares that the current nodes in this path are only the nodes
 // passed as arguments.
-func (p *Path) Is(nodes ...string) *Path {
-	p.stack = append(p.stack, isMorphism(nodes...))
-	return p
+func (p *Path) Is(nodes ...quad.Value) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, isMorphism(nodes...))
+	return np
+}
+
+// Regex represents the nodes that are matching provided regexp pattern.
+// It will only include Raw and String values.
+func (p *Path) Regex(pattern *regexp.Regexp) *Path {
+	return p.Filters(shape.Regexp{Re: pattern, Refs: false})
+}
+
+// RegexWithRefs is the same as Regex, but also matches IRIs and BNodes.
+//
+// Consider using it carefully. In most cases it's better to reconsider
+// your graph structure instead of relying on slow unoptimizable regexp.
+//
+// An example of incorrect usage is to match IRIs:
+// 	<http://example.org/page>
+// 	<http://example.org/page/foo>
+// Via regexp like:
+//	http://example.org/page.*
+//
+// The right way is to explicitly link graph nodes and query them by this relation:
+// 	<http://example.org/page/foo> <type> <http://example.org/page>
+func (p *Path) RegexWithRefs(pattern *regexp.Regexp) *Path {
+	return p.Filters(shape.Regexp{Re: pattern, Refs: true})
+}
+
+// Filter represents the nodes that are passing comparison with provided value.
+func (p *Path) Filter(op iterator.Operator, node quad.Value) *Path {
+	return p.Filters(shape.Comparison{Op: op, Val: node})
+}
+
+// Filters represents the nodes that are passing provided filters.
+func (p *Path) Filters(filters ...shape.ValueFilter) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, filterMorphism(filters))
+	return np
 }
 
 // Tag adds tag strings to the nodes at this point in the path for each result
 // path in the set.
 func (p *Path) Tag(tags ...string) *Path {
-	p.stack = append(p.stack, tagMorphism(tags...))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, tagMorphism(tags...))
+	return np
 }
 
 // Out updates this Path to represent the nodes that are adjacent to the
@@ -129,8 +213,9 @@ func (p *Path) Tag(tags ...string) *Path {
 //  // to "F" labelled "follows".
 //  StartPath(qs, "A").Out("follows")
 func (p *Path) Out(via ...interface{}) *Path {
-	p.stack = append(p.stack, outMorphism(nil, via...))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, outMorphism(nil, via...))
+	return np
 }
 
 // In updates this Path to represent the nodes that are adjacent to the
@@ -143,22 +228,25 @@ func (p *Path) Out(via ...interface{}) *Path {
 //  // edges from those nodes to "B" labelled "follows".
 //  StartPath(qs, "B").In("follows")
 func (p *Path) In(via ...interface{}) *Path {
-	p.stack = append(p.stack, inMorphism(nil, via...))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, inMorphism(nil, via...))
+	return np
 }
 
 // InWithTags is exactly like In, except it tags the value of the predicate
 // traversed with the tags provided.
 func (p *Path) InWithTags(tags []string, via ...interface{}) *Path {
-	p.stack = append(p.stack, inMorphism(tags, via...))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, inMorphism(tags, via...))
+	return np
 }
 
 // OutWithTags is exactly like In, except it tags the value of the predicate
 // traversed with the tags provided.
 func (p *Path) OutWithTags(tags []string, via ...interface{}) *Path {
-	p.stack = append(p.stack, outMorphism(tags, via...))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, outMorphism(tags, via...))
+	return np
 }
 
 // Both updates this path following both inbound and outbound predicates.
@@ -170,8 +258,25 @@ func (p *Path) OutWithTags(tags []string, via ...interface{}) *Path {
 //  // edges from those nodes to "B" labelled "follows", in either direction.
 //  StartPath(qs, "B").Both("follows")
 func (p *Path) Both(via ...interface{}) *Path {
-	p.stack = append(p.stack, bothMorphism(nil, via...))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, bothMorphism(nil, via...))
+	return np
+}
+
+// BothWithTags is exactly like Both, except it tags the value of the predicate
+// traversed with the tags provided.
+func (p *Path) BothWithTags(tags []string, via ...interface{}) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, bothMorphism(tags, via...))
+	return np
+}
+
+// Labels updates this path to represent the nodes of the labels
+// of inbound and outbound quads.
+func (p *Path) Labels() *Path {
+	np := p.clone()
+	np.stack = append(np.stack, labelsMorphism())
+	return np
 }
 
 // InPredicates updates this path to represent the nodes of the valid inbound
@@ -183,8 +288,9 @@ func (p *Path) Both(via ...interface{}) *Path {
 //  // Will return []string{"follows"} if there are any things that "follow" Bob
 //  StartPath(qs, "bob").InPredicates()
 func (p *Path) InPredicates() *Path {
-	p.stack = append(p.stack, predicatesMorphism(true))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, predicatesMorphism(true))
+	return np
 }
 
 // OutPredicates updates this path to represent the nodes of the valid inbound
@@ -197,22 +303,33 @@ func (p *Path) InPredicates() *Path {
 //  // labelled "follows", and edges from "bob" that describe his "status".
 //  StartPath(qs, "bob").OutPredicates()
 func (p *Path) OutPredicates() *Path {
-	p.stack = append(p.stack, predicatesMorphism(false))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, predicatesMorphism(false))
+	return np
+}
+
+// SavePredicates saves either forward or reverse predicates of current node
+// without changing path location.
+func (p *Path) SavePredicates(rev bool, tag string) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, savePredicatesMorphism(rev, tag))
+	return np
 }
 
 // And updates the current Path to represent the nodes that match both the
 // current Path so far, and the given Path.
 func (p *Path) And(path *Path) *Path {
-	p.stack = append(p.stack, andMorphism(path))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, andMorphism(path))
+	return np
 }
 
 // Or updates the current Path to represent the nodes that match either the
 // current Path so far, or the given Path.
 func (p *Path) Or(path *Path) *Path {
-	p.stack = append(p.stack, orMorphism(path))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, orMorphism(path))
+	return np
 }
 
 // Except updates the current Path to represent the all of the current nodes
@@ -222,22 +339,66 @@ func (p *Path) Or(path *Path) *Path {
 //  // Will return []string{"B"}
 //  StartPath(qs, "A", "B").Except(StartPath(qs, "A"))
 func (p *Path) Except(path *Path) *Path {
-	p.stack = append(p.stack, exceptMorphism(path))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, exceptMorphism(path))
+	return np
+}
+
+// Unique updates the current Path to contain only unique nodes.
+func (p *Path) Unique() *Path {
+	np := p.clone()
+	np.stack = append(np.stack, uniqueMorphism())
+	return np
 }
 
 // Follow allows you to stitch two paths together. The resulting path will start
 // from where the first path left off and continue iterating down the path given.
 func (p *Path) Follow(path *Path) *Path {
-	p.stack = append(p.stack, followMorphism(path))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, followMorphism(path))
+	return np
 }
 
 // FollowReverse is the same as follow, except it will iterate backwards up the
 // path given as argument.
 func (p *Path) FollowReverse(path *Path) *Path {
-	p.stack = append(p.stack, followMorphism(path.Reverse()))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, followMorphism(path.Reverse()))
+	return np
+}
+
+// FollowRecursive will repeatedly follow the given string predicate or Path
+// object starting from the given node(s), through the morphism or pattern
+// provided, ignoring loops. For example, this turns "parent" into "all
+// ancestors", by repeatedly following the "parent" connection on the result of
+// the parent nodes.
+//
+// The second argument, "maxDepth" is the maximum number of recursive steps before
+// stopping and returning.
+// If -1 is passed, it will have no limit.
+// If 0 is passed, it will use the default value of 50 steps before returning.
+// If 1 is passed, it will stop after 1 step before returning, and so on.
+//
+// The third argument, "depthTags" is a set of tags that will return strings of
+// numeric values relating to how many applications of the path were applied the
+// first time the result node was seen.
+//
+// This is a very expensive operation in practice. Be sure to use it wisely.
+func (p *Path) FollowRecursive(via interface{}, maxDepth int, depthTags []string) *Path {
+	var path *Path
+	switch v := via.(type) {
+	case string:
+		path = StartMorphism().Out(v)
+	case quad.Value:
+		path = StartMorphism().Out(v)
+	case *Path:
+		path = v
+	default:
+		panic("did not pass a string predicate or a Path to FollowRecursive")
+	}
+	np := p.clone()
+	np.stack = append(p.stack, followRecursiveMorphism(path, maxDepth, depthTags))
+	return np
 }
 
 // Save will, from the current nodes in the path, retrieve the node
@@ -248,22 +409,71 @@ func (p *Path) FollowReverse(path *Path) *Path {
 //  // Will return []map[string]string{{"social_status: "cool"}}
 //  StartPath(qs, "B").Save("status", "social_status"
 func (p *Path) Save(via interface{}, tag string) *Path {
-	p.stack = append(p.stack, saveMorphism(via, tag))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, saveMorphism(via, tag))
+	return np
 }
 
 // SaveReverse is the same as Save, only in the reverse direction
 // (the subject of the linkage should be tagged, instead of the object).
 func (p *Path) SaveReverse(via interface{}, tag string) *Path {
-	p.stack = append(p.stack, saveReverseMorphism(via, tag))
-	return p
+	np := p.clone()
+	np.stack = append(np.stack, saveReverseMorphism(via, tag))
+	return np
+}
+
+// SaveOptional is the same as Save, but does not require linkage to exist.
+func (p *Path) SaveOptional(via interface{}, tag string) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, saveOptionalMorphism(via, tag))
+	return np
+}
+
+// SaveOptionalReverse is the same as SaveReverse, but does not require linkage to exist.
+func (p *Path) SaveOptionalReverse(via interface{}, tag string) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, saveOptionalReverseMorphism(via, tag))
+	return np
 }
 
 // Has limits the paths to be ones where the current nodes have some linkage
 // to some known node.
-func (p *Path) Has(via interface{}, nodes ...string) *Path {
-	p.stack = append(p.stack, hasMorphism(via, nodes...))
-	return p
+func (p *Path) Has(via interface{}, nodes ...quad.Value) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, hasMorphism(via, false, nodes...))
+	return np
+}
+
+// HasReverse limits the paths to be ones where some known node have some linkage
+// to the current nodes.
+func (p *Path) HasReverse(via interface{}, nodes ...quad.Value) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, hasMorphism(via, true, nodes...))
+	return np
+}
+
+// HasFilter limits the paths to be ones where the current nodes have some linkage
+// to some nodes that pass provided filters.
+func (p *Path) HasFilter(via interface{}, rev bool, filt ...shape.ValueFilter) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, hasFilterMorphism(via, rev, filt))
+	return np
+}
+
+// LabelContext restricts the following operations (such as In, Out) to only
+// traverse edges that match the given set of labels.
+func (p *Path) LabelContext(via ...interface{}) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, labelContextMorphism(nil, via...))
+	return np
+}
+
+// LabelContextWithTags is exactly like LabelContext, except it tags the value
+// of the label used in the traversal with the tags provided.
+func (p *Path) LabelContextWithTags(tags []string, via ...interface{}) *Path {
+	np := p.clone()
+	np.stack = append(np.stack, labelContextMorphism(tags, via...))
+	return np
 }
 
 // Back returns to a previously tagged place in the path. Any constraints applied after the Tag will remain in effect, but traversal continues from the tagged point instead, not from the end of the chain.
@@ -279,7 +489,7 @@ func (p *Path) Back(tag string) *Path {
 		if i < 0 {
 			return p.Reverse()
 		}
-		if p.stack[i].Name == "tag" {
+		if p.stack[i].IsTag {
 			for _, x := range p.stack[i].tags {
 				if x == tag {
 					// Found what we're looking for.
@@ -308,7 +518,7 @@ func (p *Path) BuildIterator() graph.Iterator {
 
 // BuildIteratorOn will return an iterator for this path on the given QuadStore.
 func (p *Path) BuildIteratorOn(qs graph.QuadStore) graph.Iterator {
-	return p.Morphism()(qs, qs.NodesAllIterator())
+	return shape.BuildIterator(qs, p.Shape())
 }
 
 // Morphism returns the morphism of this path.  The returned value is a
@@ -317,11 +527,40 @@ func (p *Path) BuildIteratorOn(qs graph.QuadStore) graph.Iterator {
 // iterator matched by the current Path.
 func (p *Path) Morphism() graph.ApplyMorphism {
 	return func(qs graph.QuadStore, it graph.Iterator) graph.Iterator {
-		i := it.Clone()
-		ctx := &p.baseContext
-		for _, m := range p.stack {
-			i, ctx = m.Apply(qs, i, ctx)
-		}
-		return i
+		return p.ShapeFrom(iteratorShape{it}).BuildIterator(qs)
 	}
+}
+
+// Skip will omit a number of values from result set.
+func (p *Path) Skip(v int64) *Path {
+	p.stack = append(p.stack, skipMorphism(v))
+	return p
+}
+
+// Limit will limit a number of values in result set.
+func (p *Path) Limit(v int64) *Path {
+	p.stack = append(p.stack, limitMorphism(v))
+	return p
+}
+
+// Count will count a number of results as it's own result set.
+func (p *Path) Count() *Path {
+	p.stack = append(p.stack, countMorphism())
+	return p
+}
+
+// Iterate is an shortcut for graph.Iterate.
+func (p *Path) Iterate(ctx context.Context) *graph.IterateChain {
+	return shape.Iterate(ctx, p.qs, p.Shape())
+}
+func (p *Path) Shape() shape.Shape {
+	return p.ShapeFrom(shape.AllNodes{})
+}
+func (p *Path) ShapeFrom(from shape.Shape) shape.Shape {
+	s := from
+	ctx := &p.baseContext
+	for _, m := range p.stack {
+		s, ctx = m.Apply(s, ctx)
+	}
+	return s
 }

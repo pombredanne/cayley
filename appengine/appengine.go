@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build appengine
+// +build appengine appenginevm
 
 package main
 
@@ -21,21 +21,26 @@ import (
 	"os"
 	"time"
 
-	"github.com/barakmich/glog"
+	"github.com/cayleygraph/cayley/clog"
 
-	"github.com/google/cayley/internal/config"
-	"github.com/google/cayley/internal/db"
-	"github.com/google/cayley/internal/http"
+	"github.com/cayleygraph/cayley/internal/config"
+	"github.com/cayleygraph/cayley/internal/db"
+	"github.com/cayleygraph/cayley/internal/http"
 
-	_ "github.com/google/cayley/graph/gaedatastore"
-	_ "github.com/google/cayley/writer"
+	_ "github.com/cayleygraph/cayley/graph/gaedatastore"
+	_ "github.com/cayleygraph/cayley/writer"
+
+	// Register supported query languages
+	_ "github.com/cayleygraph/cayley/query/gizmo"
+	_ "github.com/cayleygraph/cayley/query/graphql"
+	_ "github.com/cayleygraph/cayley/query/mql"
 )
 
 var (
 	quadFile           = ""
 	quadType           = "cquad"
 	cpuprofile         = ""
-	queryLanguage      = "gremlin"
+	queryLanguage      = "gizmo"
 	configFile         = ""
 	databasePath       = ""
 	databaseBackend    = "gaedatastore"
@@ -57,7 +62,7 @@ func configFrom(file string) (*config.Config, error) {
 		file = "/cayley_appengine.cfg"
 	}
 	if file == "" {
-		glog.Infoln("Couldn't find a config file appengine.cfg. Going by flag defaults only.")
+		clog.Infof("Couldn't find a config file appengine.cfg. Going by flag defaults only.")
 	}
 	cfg, err := config.Load(file)
 	if err != nil {
@@ -98,15 +103,16 @@ func configFrom(file string) (*config.Config, error) {
 }
 
 func init() {
-	glog.SetToStderr(true)
 	cfg, err := configFrom("cayley_appengine.cfg")
 	if err != nil {
-		glog.Fatalln("Error loading config:", err)
+		clog.Fatalf("Error loading config: %v", err)
 	}
 
 	handle, err := db.Open(cfg)
 	if err != nil {
-		glog.Fatalln("Error opening database:", err)
+		clog.Fatalf("Error opening database: %v", err)
 	}
-	http.SetupRoutes(handle, cfg)
+	if err := http.SetupRoutes(handle, cfg); err != nil {
+		clog.Fatalf("Error setting up routes: %v", err)
+	}
 }

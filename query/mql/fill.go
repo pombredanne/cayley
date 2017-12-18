@@ -15,9 +15,11 @@
 package mql
 
 import (
+	"fmt"
 	"sort"
 
-	"github.com/google/cayley/graph"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/quad"
 )
 
 func (q *Query) treeifyResult(tags map[string]graph.Value) map[ResultPath]string {
@@ -27,7 +29,7 @@ func (q *Query) treeifyResult(tags map[string]graph.Value) map[ResultPath]string
 		if v == nil {
 			continue
 		}
-		results[Path(k)] = q.ses.qs.NameOf(v)
+		results[Path(k)] = quadValueToNative(q.ses.qs.NameOf(v))
 	}
 	resultPaths := make(map[ResultPath]string)
 	for k, v := range results {
@@ -115,4 +117,12 @@ func (q *Query) buildResults() {
 	for _, v := range q.resultOrder {
 		q.results = append(q.results, q.queryResult[""][v])
 	}
+}
+
+func quadValueToNative(v quad.Value) string {
+	out := quad.NativeOf(v)
+	if nv, ok := out.(quad.Value); ok && v == nv {
+		return quad.StringOf(v)
+	}
+	return fmt.Sprint(out)
 }

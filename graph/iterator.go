@@ -17,12 +17,10 @@ package graph
 // Define the general iterator interface.
 
 import (
-	"fmt"
 	"strings"
-	"sync"
 
-	"github.com/barakmich/glog"
-	"github.com/google/cayley/quad"
+	"github.com/cayleygraph/cayley/clog"
+	"github.com/cayleygraph/cayley/quad"
 )
 
 type Tagger struct {
@@ -45,8 +43,8 @@ type Linkage struct {
 // TODO(barakmich): Helper functions as needed, eg, ValuesForDirection(quad.Direction) []Value
 
 // Add a tag to the iterator.
-func (t *Tagger) Add(tag string) {
-	t.tags = append(t.tags, tag)
+func (t *Tagger) Add(tag ...string) {
+	t.tags = append(t.tags, tag...)
 }
 
 func (t *Tagger) AddFixed(tag string, value Value) {
@@ -66,6 +64,16 @@ func (t *Tagger) Fixed() map[string]Value {
 	return t.fixedTags
 }
 
+func (t *Tagger) TagResult(dst map[string]Value, v Value) {
+	for _, tag := range t.Tags() {
+		dst[tag] = v
+	}
+
+	for tag, value := range t.Fixed() {
+		dst[tag] = value
+	}
+}
+
 func (t *Tagger) CopyFrom(src Iterator) {
 	t.CopyFromTagger(src.Tagger())
 }
@@ -82,6 +90,9 @@ func (t *Tagger) CopyFromTagger(st *Tagger) {
 }
 
 type Iterator interface {
+	// String returns a short textual representation of an iterator.
+	String() string
+
 	Tagger() *Tagger
 
 	// Fills a tag-to-result-value map.
@@ -89,6 +100,12 @@ type Iterator interface {
 
 	// Returns the current result.
 	Result() Value
+
+	// Next advances the iterator to the next value, which will then be available through
+	// the Result method. It returns false if no further advancement is possible, or if an
+	// error was encountered during iteration.  Err should be consulted to distinguish
+	// between the two cases.
+	Next() bool
 
 	// These methods are the heart and soul of the iterator, as they constitute
 	// the iteration interface.
@@ -103,7 +120,7 @@ type Iterator interface {
 	//  	}
 	//  }
 	//
-	// All of them should set iterator.Last to be the last returned value, to
+	// All of them should set iterator.result to be the last returned value, to
 	// make results work.
 	//
 	// NextPath() advances iterators that may have more than one valid result,
@@ -148,9 +165,6 @@ type Iterator interface {
 	// Return a slice of the subiterators for this iterator.
 	SubIterators() []Iterator
 
-	// Return a string representation of the iterator.
-	Describe() Description
-
 	// Close the iterator and do internal cleanup.
 	Close() error
 
@@ -158,39 +172,46 @@ type Iterator interface {
 	UID() uint64
 }
 
+// DescribeIterator returns a description of the iterator tree.
+func DescribeIterator(it Iterator) Description {
+	sz, _ := it.Size()
+	d := Description{
+		UID:  it.UID(),
+		Name: it.String(),
+		Type: it.Type(),
+		Tags: it.Tagger().Tags(),
+		Size: sz,
+	}
+	if sub := it.SubIterators(); len(sub) != 0 {
+		d.Iterators = make([]Description, 0, len(sub))
+		for _, sit := range sub {
+			d.Iterators = append(d.Iterators, DescribeIterator(sit))
+		}
+	}
+	return d
+}
+
 type Description struct {
-	UID       uint64         `json:",omitempty"`
-	Name      string         `json:",omitempty"`
-	Type      Type           `json:",omitempty"`
-	Tags      []string       `json:",omitempty"`
-	Size      int64          `json:",omitempty"`
-	Direction quad.Direction `json:",omitempty"`
-	Iterator  *Description   `json:",omitempty"`
-	Iterators []Description  `json:",omitempty"`
+	UID       uint64        `json:",omitempty"`
+	Name      string        `json:",omitempty"`
+	Type      Type          `json:",omitempty"`
+	Tags      []string      `json:",omitempty"`
+	Size      int64         `json:",omitempty"`
+	Iterators []Description `json:",omitempty"`
 }
 
 // ApplyMorphism is a curried function that can generates a new iterator based on some prior iterator.
 type ApplyMorphism func(QuadStore, Iterator) Iterator
 
-type Nexter interface {
-	// Next advances the iterator to the next value, which will then be available through
-	// the Result method. It returns false if no further advancement is possible, or if an
-	// error was encountered during iteration.  Err should be consulted to distinguish
-	// between the two cases.
-	Next() bool
-
-	Iterator
+// CanNext is a helper for checking if iterator can be Next()'ed.
+func CanNext(it Iterator) bool {
+	_, ok := it.(NoNext)
+	return !ok
 }
 
-// Next is a convenience function that conditionally calls the Next method
-// of an Iterator if it is a Nexter. If the Iterator is not a Nexter, Next
-// returns false.
-func Next(it Iterator) bool {
-	if n, ok := it.(Nexter); ok {
-		return n.Next()
-	}
-	glog.Errorln("Nexting an un-nextable iterator")
-	return false
+// NoNext is an optional interface to signal that iterator should be Contain()'ed instead of Next()'ing if possible.
+type NoNext interface {
+	NoNext()
 }
 
 // Height is a convienence function to measure the height of an iterator tree.
@@ -219,95 +240,43 @@ type IteratorStats struct {
 	ContainsCost int64
 	NextCost     int64
 	Size         int64
+	ExactSize    bool
 	Next         int64
 	Contains     int64
 	ContainsNext int64
 }
 
 // Type enumerates the set of Iterator types.
-type Type int
+type Type string
 
 // These are the iterator types, defined as constants
 const (
-	Invalid Type = iota
-	All
-	And
-	Or
-	HasA
-	LinksTo
-	Comparison
-	Null
-	Fixed
-	Not
-	Optional
-	Materialize
-	Unique
+	Invalid     = Type("")
+	All         = Type("all")
+	And         = Type("and")
+	Or          = Type("or")
+	HasA        = Type("hasa")
+	LinksTo     = Type("linksto")
+	Comparison  = Type("comparison")
+	Null        = Type("null")
+	Fixed       = Type("fixed")
+	Not         = Type("not")
+	Optional    = Type("optional")
+	Materialize = Type("materialize")
+	Unique      = Type("unique")
+	Limit       = Type("limit")
+	Skip        = Type("skip")
+	Regex       = Type("regexp")
+	Count       = Type("count")
+	Recursive   = Type("recursive")
 )
-
-var (
-	// We use a sync.Mutex rather than an RWMutex since the client packages keep
-	// the Type that was returned, so the only possibility for contention is at
-	// initialization.
-	lock sync.Mutex
-	// These strings must be kept in order consistent with the Type const block above.
-	types = []string{
-		"invalid",
-		"all",
-		"and",
-		"or",
-		"hasa",
-		"linksto",
-		"comparison",
-		"null",
-		"fixed",
-		"not",
-		"optional",
-		"materialize",
-		"unique",
-	}
-)
-
-// RegisterIterator adds a new iterator type to the set of acceptable types, returning
-// the registered Type.
-// Calls to Register are idempotent and must be made prior to use of the iterator.
-// The conventional approach for use is to include a call to Register in a package
-// init() function, saving the Type to a private package var.
-func RegisterIterator(name string) Type {
-	lock.Lock()
-	defer lock.Unlock()
-	for i, t := range types {
-		if t == name {
-			return Type(i)
-		}
-	}
-	types = append(types, name)
-	return Type(len(types) - 1)
-}
 
 // String returns a string representation of the Type.
 func (t Type) String() string {
-	if t < 0 || int(t) >= len(types) {
+	if t == "" {
 		return "illegal-type"
 	}
-	return types[t]
-}
-
-func (t *Type) MarshalText() (text []byte, err error) {
-	if *t < 0 || int(*t) >= len(types) {
-		return nil, fmt.Errorf("graph: illegal iterator type: %d", *t)
-	}
-	return []byte(types[*t]), nil
-}
-
-func (t *Type) UnmarshalText(text []byte) error {
-	s := string(text)
-	for i, c := range types[1:] {
-		if c == s {
-			*t = Type(i + 1)
-			return nil
-		}
-	}
-	return fmt.Errorf("graph: unknown iterator label: %q", text)
+	return string(t)
 }
 
 type StatsContainer struct {
@@ -332,34 +301,35 @@ func DumpStats(it Iterator) StatsContainer {
 // well as what they return. Highly useful for tracing the execution path of a query.
 
 func ContainsLogIn(it Iterator, val Value) {
-	if glog.V(4) {
-		glog.V(4).Infof("%s %d CHECK CONTAINS %v", strings.ToUpper(it.Type().String()), it.UID(), val)
+	if clog.V(4) {
+		clog.Infof("%s %d CHECK CONTAINS %v", strings.ToUpper(it.Type().String()), it.UID(), val)
 	}
 }
 
 func ContainsLogOut(it Iterator, val Value, good bool) bool {
-	if glog.V(4) {
+	if clog.V(4) {
 		if good {
-			glog.V(4).Infof("%s %d CHECK CONTAINS %v GOOD", strings.ToUpper(it.Type().String()), it.UID(), val)
+			clog.Infof("%s %d CHECK CONTAINS %v GOOD", strings.ToUpper(it.Type().String()), it.UID(), val)
 		} else {
-			glog.V(4).Infof("%s %d CHECK CONTAINS %v BAD", strings.ToUpper(it.Type().String()), it.UID(), val)
+			clog.Infof("%s %d CHECK CONTAINS %v BAD", strings.ToUpper(it.Type().String()), it.UID(), val)
 		}
 	}
 	return good
 }
 
 func NextLogIn(it Iterator) {
-	if glog.V(4) {
-		glog.V(4).Infof("%s %d NEXT", strings.ToUpper(it.Type().String()), it.UID())
+	if clog.V(4) {
+		clog.Infof("%s %d NEXT", strings.ToUpper(it.Type().String()), it.UID())
 	}
 }
 
-func NextLogOut(it Iterator, val Value, ok bool) bool {
-	if glog.V(4) {
+func NextLogOut(it Iterator, ok bool) bool {
+	if clog.V(4) {
 		if ok {
-			glog.V(4).Infof("%s %d NEXT IS %v", strings.ToUpper(it.Type().String()), it.UID(), val)
+			val := it.Result()
+			clog.Infof("%s %d NEXT IS %v (%T)", strings.ToUpper(it.Type().String()), it.UID(), val, val)
 		} else {
-			glog.V(4).Infof("%s %d NEXT DONE", strings.ToUpper(it.Type().String()), it.UID())
+			clog.Infof("%s %d NEXT DONE", strings.ToUpper(it.Type().String()), it.UID())
 		}
 	}
 	return ok

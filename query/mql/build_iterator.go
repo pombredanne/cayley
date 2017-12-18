@@ -20,14 +20,14 @@ import (
 	"math"
 	"strings"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/quad"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
 )
 
 func (q *Query) buildFixed(s string) graph.Iterator {
 	f := q.ses.qs.FixedIterator()
-	f.Add(q.ses.qs.ValueOf(s))
+	f.Add(q.ses.qs.ValueOf(quad.StringToValue(s)))
 	return f
 }
 
@@ -92,7 +92,7 @@ func (q *Query) buildIteratorTreeInternal(query interface{}, path Path) (it grap
 		it = q.buildResultIterator(path)
 		optional = true
 	default:
-		err = fmt.Errorf("Unknown JSON type: %T")
+		err = fmt.Errorf("Unknown JSON type: %T", query)
 	}
 	if err != nil {
 		return nil, false, err
@@ -138,7 +138,7 @@ func (q *Query) buildIteratorTreeMapInternal(query map[string]interface{}, path 
 			}
 			subAnd := iterator.NewAnd(q.ses.qs)
 			predFixed := q.ses.qs.FixedIterator()
-			predFixed.Add(q.ses.qs.ValueOf(pred))
+			predFixed.Add(q.ses.qs.ValueOf(quad.StringToValue(pred)))
 			subAnd.AddSubIterator(iterator.NewLinksTo(q.ses.qs, predFixed, quad.Predicate))
 			if reverse {
 				lto := iterator.NewLinksTo(q.ses.qs, builtIt, quad.Subject)

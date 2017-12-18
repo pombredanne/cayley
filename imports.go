@@ -1,11 +1,11 @@
 package cayley
 
 import (
-	"github.com/google/cayley/graph"
-	_ "github.com/google/cayley/graph/memstore"
-	"github.com/google/cayley/graph/path"
-	"github.com/google/cayley/quad"
-	_ "github.com/google/cayley/writer"
+	"github.com/cayleygraph/cayley/graph"
+	_ "github.com/cayleygraph/cayley/graph/memstore"
+	"github.com/cayleygraph/cayley/graph/path"
+	"github.com/cayleygraph/cayley/quad"
+	_ "github.com/cayleygraph/cayley/writer"
 )
 
 type Iterator graph.Iterator
@@ -18,7 +18,6 @@ var (
 	StartMorphism = path.StartMorphism
 	StartPath     = path.StartPath
 
-	RawNext        = graph.Next
 	NewTransaction = graph.NewTransaction
 )
 
@@ -27,8 +26,12 @@ type Handle struct {
 	graph.QuadWriter
 }
 
-func Quad(subject, predicate, object, label string) quad.Quad {
-	return quad.Quad{subject, predicate, object, label}
+func Triple(subject, predicate, object interface{}) quad.Quad {
+	return Quad(subject, predicate, object, nil)
+}
+
+func Quad(subject, predicate, object, label interface{}) quad.Quad {
+	return quad.Make(subject, predicate, object, label)
 }
 
 func NewGraph(name, dbpath string, opts graph.Options) (*Handle, error) {
@@ -47,7 +50,8 @@ func NewMemoryGraph() (*Handle, error) {
 	return NewGraph("memstore", "", nil)
 }
 
-func (h *Handle) Close() {
+func (h *Handle) Close() error {
+	err := h.QuadWriter.Close()
 	h.QuadStore.Close()
-	h.QuadWriter.Close()
+	return err
 }

@@ -19,24 +19,20 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/barakmich/glog"
 	"github.com/boltdb/bolt"
+	"github.com/cayleygraph/cayley/clog"
 
-	"github.com/google/cayley/graph"
-	"github.com/google/cayley/graph/iterator"
-	"github.com/google/cayley/graph/proto"
-	"github.com/google/cayley/quad"
+	"github.com/cayleygraph/cayley/graph"
+	"github.com/cayleygraph/cayley/graph/iterator"
+	"github.com/cayleygraph/cayley/quad"
 )
 
+var _ graph.Iterator = &Iterator{}
+
 var (
-	boltType    graph.Type
 	bufferSize  = 50
 	errNotExist = errors.New("quad does not exist")
 )
-
-func init() {
-	boltType = graph.RegisterIterator("bolt")
-}
 
 type Iterator struct {
 	uid     uint64
@@ -56,7 +52,7 @@ type Iterator struct {
 func NewIterator(bucket []byte, d quad.Direction, value graph.Value, qs *QuadStore) *Iterator {
 	tok := value.(*Token)
 	if !bytes.Equal(tok.bucket, nodeBucket) {
-		glog.Error("creating an iterator from a non-node value")
+		clog.Errorf("creating an iterator from a non-node value")
 		return &Iterator{done: true}
 	}
 
@@ -74,8 +70,6 @@ func NewIterator(bucket []byte, d quad.Direction, value graph.Value, qs *QuadSto
 	return &it
 }
 
-func Type() graph.Type { return boltType }
-
 func (it *Iterator) UID() uint64 {
 	return it.uid
 }
@@ -91,17 +85,11 @@ func (it *Iterator) Tagger() *graph.Tagger {
 }
 
 func (it *Iterator) TagResults(dst map[string]graph.Value) {
-	for _, tag := range it.tags.Tags() {
-		dst[tag] = it.Result()
-	}
-
-	for tag, value := range it.tags.Fixed() {
-		dst[tag] = value
-	}
+	it.tags.TagResult(dst, it.Result())
 }
 
 func (it *Iterator) Clone() graph.Iterator {
-	out := NewIterator(it.bucket, it.dir, &Token{nodeBucket, it.checkID}, it.qs)
+	out := NewIterator(it.bucket, it.dir, &Token{true, nodeBucket, it.checkID}, it.qs)
 	out.Tagger().CopyFrom(it)
 	return out
 }
@@ -111,12 +99,6 @@ func (it *Iterator) Close() error {
 	it.buffer = nil
 	it.done = true
 	return nil
-}
-
-func (it *Iterator) isLiveValue(val []byte) bool {
-	var entry proto.HistoryEntry
-	entry.Unmarshal(val)
-	return len(entry.History)%2 != 0
 }
 
 func (it *Iterator) Next() bool {
@@ -137,11 +119,8 @@ func (it *Iterator) Next() bool {
 			if last == nil {
 				k, v := cur.Seek(it.checkID)
 				if bytes.HasPrefix(k, it.checkID) {
-					if it.isLiveValue(v) {
-						var out []byte
-						out = make([]byte, len(k))
-						copy(out, k)
-						it.buffer = append(it.buffer, out)
+					if isLiveValue(v) {
+						it.buffer = append(it.buffer, clone(k))
 						i++
 					}
 				} else {
@@ -160,20 +139,17 @@ func (it *Iterator) Next() bool {
 					it.buffer = append(it.buffer, nil)
 					break
 				}
-				if !it.isLiveValue(v) {
+				if !isLiveValue(v) {
 					continue
 				}
-				var out []byte
-				out = make([]byte, len(k))
-				copy(out, k)
-				it.buffer = append(it.buffer, out)
+				it.buffer = append(it.buffer, clone(k))
 				i++
 			}
 			return nil
 		})
 		if err != nil {
 			if err != errNotExist {
-				glog.Errorf("Error nexting in database: %v", err)
+				clog.Errorf("Error nexting in database: %v", err)
 				it.err = err
 			}
 			it.done = true
@@ -224,45 +200,45 @@ func PositionOf(tok *Token, d quad.Direction, qs *QuadStore) int {
 		case quad.Subject:
 			return 0
 		case quad.Predicate:
-			return hashSize
+			return quad.HashSize
 		case quad.Object:
-			return 2 * hashSize
+			return 2 * quad.HashSize
 		case quad.Label:
-			return 3 * hashSize
+			return 3 * quad.HashSize
 		}
 	}
 	if bytes.Equal(tok.bucket, posBucket) {
 		switch d {
 		case quad.Subject:
-			return 2 * hashSize
+			return 2 * quad.HashSize
 		case quad.Predicate:
 			return 0
 		case quad.Object:
-			return hashSize
+			return quad.HashSize
 		case quad.Label:
-			return 3 * hashSize
+			return 3 * quad.HashSize
 		}
 	}
 	if bytes.Equal(tok.bucket, ospBucket) {
 		switch d {
 		case quad.Subject:
-			return hashSize
+			return quad.HashSize
 		case quad.Predicate:
-			return 2 * hashSize
+			return 2 * quad.HashSize
 		case quad.Object:
 			return 0
 		case quad.Label:
-			return 3 * hashSize
+			return 3 * quad.HashSize
 		}
 	}
 	if bytes.Equal(tok.bucket, cpsBucket) {
 		switch d {
 		case quad.Subject:
-			return 2 * hashSize
+			return 2 * quad.HashSize
 		case quad.Predicate:
-			return hashSize
+			return quad.HashSize
 		case quad.Object:
-			return 3 * hashSize
+			return 3 * quad.HashSize
 		case quad.Label:
 			return 0
 		}
@@ -295,18 +271,11 @@ func (it *Iterator) Size() (int64, bool) {
 	return it.size, true
 }
 
-func (it *Iterator) Describe() graph.Description {
-	return graph.Description{
-		UID:       it.UID(),
-		Name:      it.qs.NameOf(&Token{it.bucket, it.checkID}),
-		Type:      it.Type(),
-		Tags:      it.tags.Tags(),
-		Size:      it.size,
-		Direction: it.dir,
-	}
+func (it *Iterator) String() string {
+	return fmt.Sprintf("BoltIter(%q)", it.bucket)
 }
 
-func (it *Iterator) Type() graph.Type { return boltType }
+func (it *Iterator) Type() graph.Type { return "bolt" }
 func (it *Iterator) Sorted() bool     { return false }
 
 func (it *Iterator) Optimize() (graph.Iterator, bool) {
@@ -314,12 +283,11 @@ func (it *Iterator) Optimize() (graph.Iterator, bool) {
 }
 
 func (it *Iterator) Stats() graph.IteratorStats {
-	s, _ := it.Size()
+	s, exact := it.Size()
 	return graph.IteratorStats{
 		ContainsCost: 1,
 		NextCost:     4,
 		Size:         s,
+		ExactSize:    exact,
 	}
 }
-
-var _ graph.Nexter = &Iterator{}
